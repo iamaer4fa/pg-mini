@@ -23,7 +23,7 @@ pub fn render_columns_view(
             if !table.is_empty() {
                 if ui.add(
                     egui::Button::new(RichText::new("➕ Add Column...").strong().color(Color32::WHITE))
-                        .fill(Color32::from_rgb(30, 120, 60)),
+                        .fill(Color32::from_rgb(16, 145, 90)),
                 )
                 .clicked()
                 {

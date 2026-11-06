@@ -136,7 +136,6 @@ pub fn render_data_table(
                         offset,
                     });
                 }
-
                 // Limit selector
                 egui::ComboBox::from_id_salt("page_limit_select")
                     .width(75.0)

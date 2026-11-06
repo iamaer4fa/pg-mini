@@ -12,6 +12,7 @@ use crate::ui::data_table::{export_to_csv, render_data_table, DataTableAction, D
 use crate::ui::dialogs::{render_confirm_dialog, AddColumnModal, CreateTableModal};
 use crate::ui::sidebar::{Sidebar, SidebarAction};
 use crate::ui::sql_editor::{SqlEditor, SqlEditorAction};
+use crate::ui::theme::setup_custom_theme;
 
 #[derive(PartialEq)]
 pub enum ActiveTab {
@@ -63,11 +64,7 @@ impl PgMiniApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config = ConfigManager::load();
 
-        if config.dark_mode {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        } else {
-            cc.egui_ctx.set_visuals(egui::Visuals::light());
-        }
+        setup_custom_theme(&cc.egui_ctx, config.dark_mode);
 
         let initial_cfg = config
             .saved_connections
@@ -193,7 +190,6 @@ impl PgMiniApp {
                         Ok((schema, table, columns)) => {
                             self.selected_table = Some((schema, table));
                             self.current_columns = columns;
-                            self.active_tab = ActiveTab::SchemaView;
                         }
                         Err(e) => {
                             self.show_toast(format!("Error fetching schema: {}", e), true);
@@ -265,7 +261,11 @@ impl eframe::App for PgMiniApp {
                 } else {
                     ui.label(RichText::new("●").color(Color32::from_rgb(220, 50, 50)));
                     ui.label(RichText::new("Disconnected").color(Color32::GRAY));
-                    if ui.add(egui::Button::new("🔌 Connect...").fill(Color32::from_rgb(30, 110, 60))).clicked() {
+                    if ui.add(
+                        egui::Button::new(RichText::new("🔌 Connect...").strong().color(Color32::WHITE))
+                            .fill(Color32::from_rgb(16, 145, 90))
+                            .rounding(egui::Rounding::same(6.0)),
+                    ).clicked() {
                         self.connection_modal.is_open = true;
                     }
                 }
@@ -283,11 +283,7 @@ impl eframe::App for PgMiniApp {
                     let theme_icon = if self.config.dark_mode { "☀ Light" } else { "🌙 Dark" };
                     if ui.button(theme_icon).clicked() {
                         self.config.dark_mode = !self.config.dark_mode;
-                        if self.config.dark_mode {
-                            ctx.set_visuals(egui::Visuals::dark());
-                        } else {
-                            ctx.set_visuals(egui::Visuals::light());
-                        }
+                        setup_custom_theme(ctx, self.config.dark_mode);
                         ConfigManager::save(&self.config);
                     }
                 });
@@ -347,19 +343,28 @@ impl eframe::App for PgMiniApp {
                         SidebarAction::RefreshDatabases => {
                             self.db_worker.send(DbRequest::FetchDatabases);
                         }
-                        SidebarAction::SelectTable { schema, table } => {
+                        SidebarAction::SelectTable { schema, table, limit } => {
                             self.selected_table = Some((schema.clone(), table.clone()));
+                            self.table_data_state.page_limit = limit;
                             self.table_data_state.current_page = 0;
                             self.db_worker.send(DbRequest::FetchTableData {
                                 schema: schema.clone(),
                                 table: table.clone(),
-                                limit: self.table_data_state.page_limit,
+                                limit,
                                 offset: 0,
                             });
                             self.db_worker.send(DbRequest::FetchColumns { schema, table });
                         }
+                        SidebarAction::CountRows { schema, table } => {
+                            self.db_worker.send(DbRequest::ExecuteSql(format!(
+                                "SELECT count(*) AS total_rows FROM \"{}\".\"{}\";",
+                                schema, table
+                            )));
+                            self.active_tab = ActiveTab::SqlEditor;
+                        }
                         SidebarAction::ViewColumns { schema, table } => {
                             self.selected_table = Some((schema.clone(), table.clone()));
+                            self.active_tab = ActiveTab::SchemaView;
                             self.db_worker.send(DbRequest::FetchColumns { schema, table });
                         }
                         SidebarAction::OpenInEditor { schema, table } => {

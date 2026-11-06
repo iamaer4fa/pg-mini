@@ -4,3 +4,4 @@ pub mod data_table;
 pub mod dialogs;
 pub mod sidebar;
 pub mod sql_editor;
+pub mod theme;

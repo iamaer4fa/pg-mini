@@ -131,8 +131,9 @@ impl AddColumnModal {
                         let is_valid = !self.form.column_name.trim().is_empty();
                         let btn = ui.add_enabled(
                             is_valid && !is_busy,
-                            egui::Button::new(RichText::new("➕ Add Column").strong())
-                                .fill(Color32::from_rgb(30, 120, 60)),
+                            egui::Button::new(RichText::new("➕ Add Column").strong().color(Color32::WHITE))
+                                .fill(Color32::from_rgb(16, 145, 90))
+                                .rounding(egui::Rounding::same(6.0)),
                         );
 
                         if btn.clicked() {
@@ -251,8 +252,9 @@ impl CreateTableModal {
                         let is_valid = !self.form.table_name.trim().is_empty();
                         let btn = ui.add_enabled(
                             is_valid && !is_busy,
-                            egui::Button::new(RichText::new("➕ Create Table").strong())
-                                .fill(Color32::from_rgb(30, 120, 60)),
+                            egui::Button::new(RichText::new("➕ Create Table").strong().color(Color32::WHITE))
+                                .fill(Color32::from_rgb(16, 145, 90))
+                                .rounding(egui::Rounding::same(6.0)),
                         );
 
                         if btn.clicked() {
@@ -306,7 +308,8 @@ pub fn render_confirm_dialog(
                     let confirm_btn = ui.add_enabled(
                         !is_busy,
                         egui::Button::new(RichText::new("Yes, Delete").strong().color(Color32::WHITE))
-                            .fill(Color32::from_rgb(180, 40, 40)),
+                            .fill(Color32::from_rgb(185, 35, 35))
+                            .rounding(egui::Rounding::same(6.0)),
                     );
 
                     if confirm_btn.clicked() {

@@ -60,7 +60,7 @@ impl SqlEditor {
                         .strong()
                         .color(Color32::WHITE),
                 )
-                .fill(Color32::from_rgb(40, 130, 70)),
+                .fill(Color32::from_rgb(16, 145, 90)),
             );
 
             if run_btn.clicked() {

@@ -160,7 +160,7 @@ impl ConnectionModal {
                         let connect_btn = ui.add_enabled(
                             !is_busy,
                             egui::Button::new(RichText::new(if is_busy { "⏳ Connecting..." } else { "🔌 Connect" }).strong())
-                                .fill(Color32::from_rgb(30, 120, 60))
+                                .fill(Color32::from_rgb(16, 145, 90)),
                         );
 
                         if connect_btn.clicked() {
