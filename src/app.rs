@@ -1,12 +1,15 @@
 use std::time::{Duration, Instant};
-use egui::{Color32, RichText, TopBottomPanel, CentralPanel, SidePanel};
+use egui::{CentralPanel, Color32, RichText, SidePanel, TopBottomPanel};
 
 use crate::config::ConfigManager;
 use crate::db::{DbRequest, DbResponse, DbWorker};
-use crate::models::{AppConfig, ColumnItem, QueryResult, TableItem};
-use crate::ui::columns_view::render_columns_view;
+use crate::models::{
+    AppConfig, ColumnItem, ConfirmAction, ConfirmDialogState, DatabaseItem, QueryResult, TableItem,
+};
+use crate::ui::columns_view::{render_columns_view, ColumnsViewAction};
 use crate::ui::connection_modal::ConnectionModal;
 use crate::ui::data_table::{export_to_csv, render_data_table, DataTableAction, DataTableState};
+use crate::ui::dialogs::{render_confirm_dialog, AddColumnModal, CreateTableModal};
 use crate::ui::sidebar::{Sidebar, SidebarAction};
 use crate::ui::sql_editor::{SqlEditor, SqlEditorAction};
 
@@ -30,10 +33,12 @@ pub struct PgMiniApp {
     // Connection state
     is_connected: bool,
     is_busy: bool,
-    server_info: String,
+    current_db: String,
+    host_port: String,
     connection_modal: ConnectionModal,
 
     // Data
+    databases: Vec<DatabaseItem>,
     tables: Vec<TableItem>,
     selected_table: Option<(String, String)>, // (schema, table_name)
     current_table_data: Option<QueryResult>,
@@ -41,6 +46,11 @@ pub struct PgMiniApp {
     current_columns: Vec<ColumnItem>,
     sql_editor: SqlEditor,
     last_query_result: Option<Result<QueryResult, String>>,
+
+    // Modals
+    add_column_modal: AddColumnModal,
+    create_table_modal: CreateTableModal,
+    confirm_dialog: ConfirmDialogState,
 
     // UI State
     active_tab: ActiveTab,
@@ -73,8 +83,10 @@ impl PgMiniApp {
             db_worker: DbWorker::new(),
             is_connected: false,
             is_busy: false,
-            server_info: String::new(),
+            current_db: String::new(),
+            host_port: String::new(),
             connection_modal,
+            databases: Vec::new(),
             tables: Vec::new(),
             selected_table: None,
             current_table_data: None,
@@ -82,6 +94,9 @@ impl PgMiniApp {
             current_columns: Vec::new(),
             sql_editor: SqlEditor::default(),
             last_query_result: None,
+            add_column_modal: AddColumnModal::default(),
+            create_table_modal: CreateTableModal::default(),
+            confirm_dialog: ConfirmDialogState::default(),
             active_tab: ActiveTab::SqlEditor,
             sidebar: Sidebar::default(),
             toast: None,
@@ -106,10 +121,12 @@ impl PgMiniApp {
                     host_port,
                 } => {
                     self.is_connected = true;
-                    self.server_info = format!("{} ({})", host_port, current_db);
+                    self.current_db = current_db.clone();
+                    self.host_port = host_port.clone();
                     self.connection_modal.is_open = false;
-                    self.show_toast(format!("Connected to {}", self.server_info), false);
-                    // Fetch tables automatically on connect
+                    self.show_toast(format!("Connected to {} on {}", current_db, host_port), false);
+                    // Fetch both databases and tables automatically on connect
+                    self.db_worker.send(DbRequest::FetchDatabases);
                     self.db_worker.send(DbRequest::FetchTables);
                 }
                 DbResponse::ConnectionFailed(err) => {
@@ -119,12 +136,36 @@ impl PgMiniApp {
                 }
                 DbResponse::Disconnected => {
                     self.is_connected = false;
+                    self.databases.clear();
                     self.tables.clear();
                     self.selected_table = None;
                     self.current_table_data = None;
                     self.current_columns.clear();
                     self.last_query_result = None;
                     self.show_toast("Disconnected from PostgreSQL", false);
+                }
+                DbResponse::DatabasesFetched(res) => {
+                    match res {
+                        Ok(dbs) => {
+                            self.databases = dbs;
+                        }
+                        Err(e) => {
+                            self.show_toast(format!("Error fetching databases: {}", e), true);
+                        }
+                    }
+                }
+                DbResponse::DatabaseSwitched {
+                    db_name,
+                    server_version: _,
+                } => {
+                    self.current_db = db_name.clone();
+                    self.selected_table = None;
+                    self.current_table_data = None;
+                    self.current_columns.clear();
+                    self.show_toast(format!("Switched to database '{}'", db_name), false);
+                    // Refresh both databases and tables
+                    self.db_worker.send(DbRequest::FetchDatabases);
+                    self.db_worker.send(DbRequest::FetchTables);
                 }
                 DbResponse::TablesFetched(res) => {
                     match res {
@@ -163,6 +204,35 @@ impl PgMiniApp {
                     self.last_query_result = Some(res);
                     self.active_tab = ActiveTab::SqlEditor;
                 }
+                DbResponse::OperationSuccess {
+                    message,
+                    refresh_tables,
+                    refresh_columns,
+                } => {
+                    self.show_toast(message, false);
+                    if refresh_tables {
+                        self.db_worker.send(DbRequest::FetchTables);
+                    }
+                    if refresh_columns {
+                        if let Some((ref s, ref t)) = self.selected_table {
+                            self.db_worker.send(DbRequest::FetchColumns {
+                                schema: s.clone(),
+                                table: t.clone(),
+                            });
+                            // Also refresh table data if open
+                            let offset = self.table_data_state.current_page * self.table_data_state.page_limit;
+                            self.db_worker.send(DbRequest::FetchTableData {
+                                schema: s.clone(),
+                                table: t.clone(),
+                                limit: self.table_data_state.page_limit,
+                                offset,
+                            });
+                        }
+                    }
+                }
+                DbResponse::OperationFailed(err) => {
+                    self.show_toast(err, true);
+                }
                 DbResponse::Busy(busy) => {
                     self.is_busy = busy;
                 }
@@ -188,7 +258,7 @@ impl eframe::App for PgMiniApp {
                 // Connection badge
                 if self.is_connected {
                     ui.label(RichText::new("●").color(Color32::from_rgb(50, 220, 80)));
-                    ui.label(RichText::new(&self.server_info).strong());
+                    ui.label(RichText::new(format!("{}/{}", self.host_port, self.current_db)).strong());
                     if ui.button("🔌 Disconnect").clicked() {
                         self.db_worker.send(DbRequest::Disconnect);
                     }
@@ -229,7 +299,7 @@ impl eframe::App for PgMiniApp {
         TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(toast) = &self.toast {
-                    if toast.created_at.elapsed() < Duration::from_secs(4) {
+                    if toast.created_at.elapsed() < Duration::from_secs(5) {
                         let color = if toast.is_error {
                             Color32::LIGHT_RED
                         } else {
@@ -238,8 +308,13 @@ impl eframe::App for PgMiniApp {
                         ui.label(RichText::new(&toast.message).color(color).strong());
                     }
                 } else {
+                    let status_txt = if self.is_connected {
+                        format!("Connected: {} | Active DB: {}", self.host_port, self.current_db)
+                    } else {
+                        "Ready | Click 'Connect...' to start".to_string()
+                    };
                     ui.label(
-                        RichText::new("Ready | Powered by native Rust & tokio-postgres")
+                        RichText::new(status_txt)
                             .size(11.0)
                             .color(Color32::DARK_GRAY),
                     );
@@ -251,14 +326,27 @@ impl eframe::App for PgMiniApp {
             });
         });
 
-        // Left Sidebar: Tables & Views Explorer
+        // Left Sidebar: Databases, Tables & Views Explorer
         SidePanel::left("left_sidebar")
             .resizable(true)
-            .default_width(240.0)
-            .width_range(160.0..=400.0)
+            .default_width(260.0)
+            .width_range(180.0..=450.0)
             .show(ctx, |ui| {
-                if let Some(action) = self.sidebar.show(ui, &self.tables, self.is_connected, self.is_busy) {
+                if let Some(action) = self.sidebar.show(
+                    ui,
+                    &self.databases,
+                    &self.tables,
+                    &self.current_db,
+                    self.is_connected,
+                    self.is_busy,
+                ) {
                     match action {
+                        SidebarAction::SwitchDatabase(db_name) => {
+                            self.db_worker.send(DbRequest::SwitchDatabase(db_name));
+                        }
+                        SidebarAction::RefreshDatabases => {
+                            self.db_worker.send(DbRequest::FetchDatabases);
+                        }
                         SidebarAction::SelectTable { schema, table } => {
                             self.selected_table = Some((schema.clone(), table.clone()));
                             self.table_data_state.current_page = 0;
@@ -268,7 +356,6 @@ impl eframe::App for PgMiniApp {
                                 limit: self.table_data_state.page_limit,
                                 offset: 0,
                             });
-                            // Also pre-fetch columns
                             self.db_worker.send(DbRequest::FetchColumns { schema, table });
                         }
                         SidebarAction::ViewColumns { schema, table } => {
@@ -278,6 +365,42 @@ impl eframe::App for PgMiniApp {
                         SidebarAction::OpenInEditor { schema, table } => {
                             self.sql_editor.sql_text = format!("SELECT * FROM \"{}\".\"{}\" LIMIT 100;", schema, table);
                             self.active_tab = ActiveTab::SqlEditor;
+                        }
+                        SidebarAction::OpenQueryToolForDb(db_name) => {
+                            if db_name != self.current_db {
+                                self.db_worker.send(DbRequest::SwitchDatabase(db_name));
+                            }
+                            self.active_tab = ActiveTab::SqlEditor;
+                        }
+                        SidebarAction::OpenAddColumn { schema, table } => {
+                            self.add_column_modal.open_for(&schema, &table);
+                        }
+                        SidebarAction::OpenCreateTable { schema } => {
+                            self.create_table_modal.open_for(&schema);
+                        }
+                        SidebarAction::ConfirmDropTable { schema, table } => {
+                            self.confirm_dialog = ConfirmDialogState {
+                                is_open: true,
+                                title: "Drop Table".to_string(),
+                                message: format!("Are you sure you want to permanently drop table '{}.{}' and delete all its data?", schema, table),
+                                action: Some(ConfirmAction::DropTable { schema, table }),
+                            };
+                        }
+                        SidebarAction::ConfirmTruncateTable { schema, table } => {
+                            self.confirm_dialog = ConfirmDialogState {
+                                is_open: true,
+                                title: "Truncate Table".to_string(),
+                                message: format!("Are you sure you want to truncate table '{}.{}'? All records will be removed.", schema, table),
+                                action: Some(ConfirmAction::TruncateTable { schema, table }),
+                            };
+                        }
+                        SidebarAction::ConfirmDropDatabase { db_name } => {
+                            self.confirm_dialog = ConfirmDialogState {
+                                is_open: true,
+                                title: "Drop Database".to_string(),
+                                message: format!("Are you sure you want to permanently delete database '{}'?", db_name),
+                                action: Some(ConfirmAction::DropDatabase { db_name }),
+                            };
                         }
                         SidebarAction::RefreshTables => {
                             self.db_worker.send(DbRequest::FetchTables);
@@ -425,12 +548,30 @@ impl eframe::App for PgMiniApp {
                         .map(|(s, t)| (s.as_str(), t.as_str()))
                         .unwrap_or(("public", ""));
 
-                    render_columns_view(ui, schema, table, &self.current_columns, self.is_busy);
+                    if let Some(action) = render_columns_view(ui, schema, table, &self.current_columns, self.is_busy) {
+                        match action {
+                            ColumnsViewAction::OpenAddColumn { schema, table } => {
+                                self.add_column_modal.open_for(&schema, &table);
+                            }
+                            ColumnsViewAction::ConfirmDropColumn { schema, table, column } => {
+                                self.confirm_dialog = ConfirmDialogState {
+                                    is_open: true,
+                                    title: "Drop Column".to_string(),
+                                    message: format!("Are you sure you want to drop column '{}' from '{}.{}'?", column, schema, table),
+                                    action: Some(ConfirmAction::DropColumn { schema, table, column }),
+                                };
+                            }
+                            ColumnsViewAction::CopyName(name) => {
+                                ctx.output_mut(|o| o.copied_text = name.clone());
+                                self.show_toast(format!("Copied column name: {}", name), false);
+                            }
+                        }
+                    }
                 }
             }
         });
 
-        // Connection Modal
+        // Modals
         if let Some(cfg) = self.connection_modal.show(
             ctx,
             &mut self.config,
@@ -438,6 +579,31 @@ impl eframe::App for PgMiniApp {
             self.is_busy,
         ) {
             self.db_worker.send(DbRequest::Connect(cfg));
+        }
+
+        if let Some(form) = self.add_column_modal.show(ctx, self.is_busy) {
+            self.db_worker.send(DbRequest::AddColumn(form));
+        }
+
+        if let Some(form) = self.create_table_modal.show(ctx, self.is_busy) {
+            self.db_worker.send(DbRequest::CreateTable(form));
+        }
+
+        if let Some(action) = render_confirm_dialog(ctx, &mut self.confirm_dialog, self.is_busy) {
+            match action {
+                ConfirmAction::DropTable { schema, table } => {
+                    self.db_worker.send(DbRequest::DropTable { schema, table });
+                }
+                ConfirmAction::TruncateTable { schema, table } => {
+                    self.db_worker.send(DbRequest::TruncateTable { schema, table });
+                }
+                ConfirmAction::DropColumn { schema, table, column } => {
+                    self.db_worker.send(DbRequest::DropColumn { schema, table, column });
+                }
+                ConfirmAction::DropDatabase { db_name } => {
+                    self.db_worker.send(DbRequest::DropDatabase { db_name });
+                }
+            }
         }
 
         // About Modal

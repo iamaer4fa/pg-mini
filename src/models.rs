@@ -27,6 +27,13 @@ impl Default for ConnectionConfig {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct DatabaseItem {
+    pub name: String,
+    pub size: Option<String>,
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CellValue {
     pub text: String,
     pub is_null: bool,
@@ -98,6 +105,75 @@ pub struct ColumnItem {
     pub is_nullable: bool,
     pub default_value: Option<String>,
     pub is_primary_key: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AddColumnForm {
+    pub schema: String,
+    pub table: String,
+    pub column_name: String,
+    pub data_type: String,
+    pub is_nullable: bool,
+    pub default_value: String,
+    pub is_primary_key: bool,
+}
+
+impl AddColumnForm {
+    pub fn new(schema: impl Into<String>, table: impl Into<String>) -> Self {
+        Self {
+            schema: schema.into(),
+            table: table.into(),
+            column_name: String::new(),
+            data_type: "VARCHAR(255)".to_string(),
+            is_nullable: true,
+            default_value: String::new(),
+            is_primary_key: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateTableForm {
+    pub schema: String,
+    pub table_name: String,
+    pub add_id_pk: bool,
+}
+
+impl CreateTableForm {
+    pub fn new(schema: impl Into<String>) -> Self {
+        Self {
+            schema: schema.into(),
+            table_name: String::new(),
+            add_id_pk: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ConfirmAction {
+    DropTable { schema: String, table: String },
+    TruncateTable { schema: String, table: String },
+    DropColumn { schema: String, table: String, column: String },
+    DropDatabase { db_name: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfirmDialogState {
+    pub is_open: bool,
+    pub title: String,
+    pub message: String,
+    pub action: Option<ConfirmAction>,
+}
+
+impl Default for ConfirmDialogState {
+    fn default() -> Self {
+        Self {
+            is_open: false,
+            title: String::new(),
+            message: String::new(),
+            action: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

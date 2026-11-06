@@ -2,12 +2,17 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
-use crate::models::{CellValue, ColumnItem, ConnectionConfig, QueryResult, TableItem};
+use crate::models::{
+    AddColumnForm, CellValue, ColumnItem, ConnectionConfig, CreateTableForm, DatabaseItem,
+    QueryResult, TableItem,
+};
 
 #[derive(Debug)]
 pub enum DbRequest {
     Connect(ConnectionConfig),
     Disconnect,
+    FetchDatabases,
+    SwitchDatabase(String),
     FetchTables,
     FetchTableData {
         schema: String,
@@ -20,6 +25,24 @@ pub enum DbRequest {
         table: String,
     },
     ExecuteSql(String),
+    AddColumn(AddColumnForm),
+    CreateTable(CreateTableForm),
+    DropTable {
+        schema: String,
+        table: String,
+    },
+    TruncateTable {
+        schema: String,
+        table: String,
+    },
+    DropColumn {
+        schema: String,
+        table: String,
+        column: String,
+    },
+    DropDatabase {
+        db_name: String,
+    },
 }
 
 #[derive(Debug)]
@@ -31,10 +54,21 @@ pub enum DbResponse {
     },
     ConnectionFailed(String),
     Disconnected,
+    DatabasesFetched(Result<Vec<DatabaseItem>, String>),
+    DatabaseSwitched {
+        db_name: String,
+        server_version: String,
+    },
     TablesFetched(Result<Vec<TableItem>, String>),
     TableDataResult(Result<QueryResult, String>),
     ColumnsFetched(Result<(String, String, Vec<ColumnItem>), String>),
     QueryResult(Result<QueryResult, String>),
+    OperationSuccess {
+        message: String,
+        refresh_tables: bool,
+        refresh_columns: bool,
+    },
+    OperationFailed(String),
     Busy(bool),
 }
 
@@ -48,7 +82,6 @@ impl DbWorker {
         let (req_tx, req_rx) = channel::<DbRequest>();
         let (res_tx, res_rx) = channel::<DbResponse>();
 
-        // Spawn Tokio runtime in background thread
         std::thread::Builder::new()
             .name("pg-mini-db-worker".to_string())
             .spawn(move || {
@@ -60,6 +93,7 @@ impl DbWorker {
 
                 rt.block_on(async move {
                     let mut current_client: Option<Client> = None;
+                    let mut current_cfg: Option<ConnectionConfig> = None;
 
                     while let Ok(req) = req_rx.recv() {
                         match req {
@@ -67,15 +101,20 @@ impl DbWorker {
                                 let _ = res_tx.send(DbResponse::Busy(true));
                                 match connect_client(&cfg).await {
                                     Ok((client, version)) => {
+                                        let current_db = cfg.database.clone();
+                                        let host_port = format!("{}:{}", cfg.host, cfg.port);
                                         current_client = Some(client);
+                                        current_cfg = Some(cfg);
+
                                         let _ = res_tx.send(DbResponse::Connected {
                                             server_version: version,
-                                            current_db: cfg.database.clone(),
-                                            host_port: format!("{}:{}", cfg.host, cfg.port),
+                                            current_db,
+                                            host_port,
                                         });
                                     }
                                     Err(err) => {
                                         current_client = None;
+                                        current_cfg = None;
                                         let _ = res_tx.send(DbResponse::ConnectionFailed(err));
                                     }
                                 }
@@ -83,7 +122,40 @@ impl DbWorker {
                             }
                             DbRequest::Disconnect => {
                                 current_client = None;
+                                current_cfg = None;
                                 let _ = res_tx.send(DbResponse::Disconnected);
+                            }
+                            DbRequest::FetchDatabases => {
+                                if let Some(client) = &current_client {
+                                    let active_db = current_cfg
+                                        .as_ref()
+                                        .map(|c| c.database.as_str())
+                                        .unwrap_or("");
+                                    let result = fetch_databases_impl(client, active_db).await;
+                                    let _ = res_tx.send(DbResponse::DatabasesFetched(result));
+                                }
+                            }
+                            DbRequest::SwitchDatabase(db_name) => {
+                                if let Some(mut cfg) = current_cfg.clone() {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    cfg.database = db_name.clone();
+                                    match connect_client(&cfg).await {
+                                        Ok((client, version)) => {
+                                            current_client = Some(client);
+                                            current_cfg = Some(cfg);
+                                            let _ = res_tx.send(DbResponse::DatabaseSwitched {
+                                                db_name,
+                                                server_version: version,
+                                            });
+                                        }
+                                        Err(err) => {
+                                            let _ = res_tx.send(DbResponse::OperationFailed(
+                                                format!("Failed to switch database: {}", err),
+                                            ));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
                             }
                             DbRequest::FetchTables => {
                                 if let Some(client) = &current_client {
@@ -129,6 +201,136 @@ impl DbWorker {
                                     )));
                                 }
                             }
+                            DbRequest::AddColumn(form) => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    let result = add_column_impl(client, &form).await;
+                                    match result {
+                                        Ok(msg) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: msg,
+                                                refresh_tables: false,
+                                                refresh_columns: true,
+                                            });
+                                        }
+                                        Err(err) => {
+                                            let _ = res_tx.send(DbResponse::OperationFailed(err));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::CreateTable(form) => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    let result = create_table_impl(client, &form).await;
+                                    match result {
+                                        Ok(msg) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: msg,
+                                                refresh_tables: true,
+                                                refresh_columns: false,
+                                            });
+                                        }
+                                        Err(err) => {
+                                            let _ = res_tx.send(DbResponse::OperationFailed(err));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::DropTable { schema, table } => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    let sql = format!(
+                                        "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE;",
+                                        escape_sql_ident(&schema),
+                                        escape_sql_ident(&table)
+                                    );
+                                    match client.simple_query(&sql).await {
+                                        Ok(_) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: format!("Table {}.{} dropped successfully", schema, table),
+                                                refresh_tables: true,
+                                                refresh_columns: false,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = res_tx.send(DbResponse::OperationFailed(format!("Failed to drop table: {}", e)));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::TruncateTable { schema, table } => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    let sql = format!(
+                                        "TRUNCATE TABLE \"{}\".\"{}\" RESTART IDENTITY CASCADE;",
+                                        escape_sql_ident(&schema),
+                                        escape_sql_ident(&table)
+                                    );
+                                    match client.simple_query(&sql).await {
+                                        Ok(_) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: format!("Table {}.{} truncated successfully", schema, table),
+                                                refresh_tables: false,
+                                                refresh_columns: false,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = res_tx.send(DbResponse::OperationFailed(format!("Failed to truncate table: {}", e)));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::DropColumn { schema, table, column } => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    let sql = format!(
+                                        "ALTER TABLE \"{}\".\"{}\" DROP COLUMN \"{}\" CASCADE;",
+                                        escape_sql_ident(&schema),
+                                        escape_sql_ident(&table),
+                                        escape_sql_ident(&column)
+                                    );
+                                    match client.simple_query(&sql).await {
+                                        Ok(_) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: format!("Column {} dropped from {}.{}", column, schema, table),
+                                                refresh_tables: false,
+                                                refresh_columns: true,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = res_tx.send(DbResponse::OperationFailed(format!("Failed to drop column: {}", e)));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::DropDatabase { db_name } => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    let sql = format!(
+                                        "DROP DATABASE IF EXISTS \"{}\";",
+                                        escape_sql_ident(&db_name)
+                                    );
+                                    match client.simple_query(&sql).await {
+                                        Ok(_) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: format!("Database {} dropped successfully", db_name),
+                                                refresh_tables: true,
+                                                refresh_columns: false,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = res_tx.send(DbResponse::OperationFailed(format!("Failed to drop database: {}", e)));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
                         }
                     }
                 });
@@ -163,14 +365,12 @@ async fn connect_client(cfg: &ConnectionConfig) -> Result<(Client, String), Stri
         .await
         .map_err(|e| format!("Failed to connect: {}", e))?;
 
-    // Spawn the connection loop
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("PostgreSQL connection error: {}", e);
         }
     });
 
-    // Query version
     let version_rows = client
         .simple_query("SELECT version();")
         .await
@@ -185,6 +385,41 @@ async fn connect_client(cfg: &ConnectionConfig) -> Result<(Client, String), Stri
         .unwrap_or_else(|| "PostgreSQL (Unknown version)".to_string());
 
     Ok((client, version))
+}
+
+async fn fetch_databases_impl(
+    client: &Client,
+    current_db: &str,
+) -> Result<Vec<DatabaseItem>, String> {
+    let sql = "
+        SELECT 
+            d.datname,
+            pg_size_pretty(pg_database_size(d.datname)) AS size
+        FROM pg_database d
+        WHERE d.datistemplate = false
+        ORDER BY d.datname;
+    ";
+
+    let messages = client
+        .simple_query(sql)
+        .await
+        .map_err(|e| format!("Failed to fetch databases: {}", e))?;
+
+    let mut databases = Vec::new();
+    for msg in messages {
+        if let SimpleQueryMessage::Row(row) = msg {
+            let name = row.get(0).unwrap_or("").to_string();
+            let size = row.get(1).map(|s| s.to_string());
+            let is_current = name == current_db;
+            databases.push(DatabaseItem {
+                name,
+                size,
+                is_current,
+            });
+        }
+    }
+
+    Ok(databases)
 }
 
 async fn fetch_tables_impl(client: &Client) -> Result<Vec<TableItem>, String> {
@@ -351,6 +586,74 @@ async fn execute_sql_impl(client: &Client, sql: &str) -> Result<QueryResult, Str
         execution_time_ms: elapsed,
         is_select,
     })
+}
+
+async fn add_column_impl(client: &Client, form: &AddColumnForm) -> Result<String, String> {
+    if form.column_name.trim().is_empty() {
+        return Err("Column name cannot be empty".to_string());
+    }
+
+    let mut sql = format!(
+        "ALTER TABLE \"{}\".\"{}\" ADD COLUMN \"{}\" {}",
+        escape_sql_ident(&form.schema),
+        escape_sql_ident(&form.table),
+        escape_sql_ident(form.column_name.trim()),
+        form.data_type.trim()
+    );
+
+    if !form.default_value.trim().is_empty() {
+        sql.push_str(&format!(" DEFAULT {}", form.default_value.trim()));
+    }
+
+    if !form.is_nullable {
+        sql.push_str(" NOT NULL");
+    }
+
+    if form.is_primary_key {
+        sql.push_str(" PRIMARY KEY");
+    }
+
+    sql.push(';');
+
+    client
+        .simple_query(&sql)
+        .await
+        .map_err(|e| format!("Failed to add column: {}", e))?;
+
+    Ok(format!(
+        "Column '{}' successfully added to {}.{}",
+        form.column_name, form.schema, form.table
+    ))
+}
+
+async fn create_table_impl(client: &Client, form: &CreateTableForm) -> Result<String, String> {
+    if form.table_name.trim().is_empty() {
+        return Err("Table name cannot be empty".to_string());
+    }
+
+    let sql = if form.add_id_pk {
+        format!(
+            "CREATE TABLE \"{}\".\"{}\" (id SERIAL PRIMARY KEY);",
+            escape_sql_ident(&form.schema),
+            escape_sql_ident(form.table_name.trim())
+        )
+    } else {
+        format!(
+            "CREATE TABLE \"{}\".\"{}\" ();",
+            escape_sql_ident(&form.schema),
+            escape_sql_ident(form.table_name.trim())
+        )
+    };
+
+    client
+        .simple_query(&sql)
+        .await
+        .map_err(|e| format!("Failed to create table: {}", e))?;
+
+    Ok(format!(
+        "Table '{}.{}' created successfully",
+        form.schema, form.table_name
+    ))
 }
 
 fn escape_sql_ident(ident: &str) -> String {

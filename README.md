@@ -36,19 +36,46 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 
 ## 🛠️ Features
 
-### 1. Connection Management & Profiles
+### 1. Database & Connection Management
+- **Sidebar Databases Tree**: Lists all active databases on your PostgreSQL server (e.g. `steniel_cmms`, `postgres`, `nocobase`) with real-time size indicators.
+- **1-Click Database Switching**: Click any database on the sidebar to instantly switch your active connection.
+- **Database Context Menu (Right-Click)**:
+  - `⚡ Open Query Tool`: Opens SQL Editor targeting this database.
+  - `➕ Create Table...`: Launches a quick table creation modal.
+  - `🔄 Refresh Tables`: Reloads schema objects.
+  - `🗑️ Drop Database...`: Drops the database with confirmation (protected against dropping active DB).
 - **Profile Management**: Save and switch between multiple PostgreSQL connection profiles (Host, Port, Database, Username, Password).
 - **Persistent Storage**: Saved connections and settings are automatically stored in `~/.config/pg-mini/config.json`.
 - **Show/Hide Password**: Quick toggle to verify database passwords.
-- **Connection Status Bar**: Displays current database, host, port, and PostgreSQL server version.
+- **Connection Status Bar**: Displays current active database, host, port, and PostgreSQL server version.
 
 ### 2. Schema & Table Explorer
 - **Sidebar Tree**: Tables and views organized neatly by schema (e.g. `public`, `information_schema`, etc.).
 - **Live Search Filter**: Quickly find tables by typing in the search box.
 - **Quick Action Badges**: Distinguishes between standard base tables (`📄`) and views (`👁`).
-- **Context Actions**: Right-click or use action buttons for *View Data*, *View Schema*, and *Open in SQL Editor*.
+- **Table Context Menu (Right-Click)**:
+  - `📊 View Data (Top 100)`: Loads table rows into the virtualized data grid.
+  - `➕ Add Column...`: Opens modal to add new columns with custom types, default values, and constraints.
+  - `📋 View Table Schema`: Opens column definitions viewer.
+  - `⚡ Query in SQL Editor`: Generates a query template in the SQL editor.
+  - `🧹 Truncate Table...`: Safely empties table records with confirmation.
+  - `🗑️ Drop Table...`: Permanently removes table with confirmation.
 
-### 3. Virtualized Data Grid (Table Viewer)
+### 3. Add Column & Table Creation Modals
+- **Add Column Modal**:
+  - Target table selection (`schema.table`).
+  - Column Name input.
+  - Data Type selector (`VARCHAR`, `TEXT`, `INTEGER`, `BIGINT`, `BOOLEAN`, `TIMESTAMP`, `TIMESTAMPTZ`, `NUMERIC`, `UUID`, `JSONB`, `BYTEA`, or custom).
+  - Nullable toggle (`NULL` / `NOT NULL`).
+  - Default Value input (e.g. `'active'`, `0`, `now()`).
+  - Primary Key checkbox.
+  - **Live SQL Preview**: Inspect the exact `ALTER TABLE ... ADD COLUMN ...` statement in real time.
+- **Create Table Modal**:
+  - Schema and Table Name inputs.
+  - Automatic `id SERIAL PRIMARY KEY` generation toggle.
+  - Live `CREATE TABLE` SQL preview.
+
+### 4. Virtualized Data Grid (Table Viewer)
 - **High Performance**: Uses `egui_extras::TableBuilder` with virtualized row rendering to smoothly browse through thousands of rows.
 - **Smart Formatting**: 
   - Numbers are right-aligned with distinct accent colors.
@@ -60,7 +87,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 - **Pagination**: Configurable page sizes (50, 100, 250, 500, 1,000 rows) with Previous/Next controls.
 - **CSV Export**: One-click RFC 4180 compliant CSV file export with file-save dialog.
 
-### 4. Multi-Line SQL Query Editor
+### 5. Multi-Line SQL Query Editor
 - **Clean Editor**: Monospace font with line padding and code styling.
 - **Keyboard Execution**: Run queries with `Ctrl + Enter` (or `F5`).
 - **Performance Timer**: Displays query execution time in milliseconds and row counts (`⚡ 3.4 ms | 120 rows returned`).
@@ -68,15 +95,19 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 - **Session History**: Remembers recently executed queries in a history dropdown.
 - **Error Reporting**: Clear, highlighted PostgreSQL error banners when syntax or constraints fail.
 
-### 5. Table Schema / Column Inspector
+### 6. Table Schema / Column Inspector
 - View table metadata:
   - Column Name
   - Data Type
   - Primary Key indicator (`🔑 YES`)
   - Nullability (`YES` / `NO`)
   - Default Values
+- Actions:
+  - `➕ Add Column...`: Add new columns directly from the schema inspector.
+  - `🗑️ Drop Column...`: Drop a column with confirmation dialog.
+  - Click column name to copy to clipboard.
 
-### 6. Theming
+### 7. Theming
 - Toggle between **Dark Mode** (default) and **Light Mode** at any time.
 
 ---
