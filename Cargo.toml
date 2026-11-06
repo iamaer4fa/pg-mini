@@ -1,0 +1,18 @@
+[package]
+name = "pg-mini"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.45"
+dirs = "7.0.0"
+eframe = "0.29"
+egui = "0.29"
+egui_extras = "0.29"
+rfd = "0.17.2"
+rust_decimal = { version = "1.43.0", features = ["db-postgres"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+uuid = { version = "1.29.0", features = ["v4"] }

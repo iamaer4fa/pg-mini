@@ -1,0 +1,14 @@
+/target/
+/dist/
+
+# Rust backup files
+*.rs.bk
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Operating system files
+.DS_Store
+Thumbs.db
