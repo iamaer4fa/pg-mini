@@ -50,10 +50,12 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 - **Connection Status Bar**: Displays current active database, host, port, and PostgreSQL server version.
 
 ### 2. Schema & Table Explorer
-- **Sidebar Tree**: Tables and views organized neatly by schema (e.g. `public`, `information_schema`, etc.).
+- **Hierarchical Object Browser**: Servers → Databases → Schemas, with Tables, Views, Materialized Views, Sequences, Functions, Procedures, Types, and Extensions.
+- **Lazy Catalog Loading**: Schemas and object categories load from PostgreSQL catalogs only when their tree nodes are expanded. Refresh and retry are available per node.
 - **Live Search Filter**: Quickly find tables by typing in the search box.
 - **Quick Action Badges**: Distinguishes between standard base tables (`📄`) and views (`👁`).
-- **Table Context Menu (Right-Click)**:
+- **Object Context Menus (Right-Click)**: Create SQL templates, inspect properties, rename, delete with confirmation, refresh, and generate object SQL. Table, view, and materialized-view nodes also open data and schema views.
+- **Table Actions**:
   - `📊 View Data (Top 100)`: Loads table rows into the virtualized data grid.
   - `➕ Add Column...`: Opens modal to add new columns with custom types, default values, and constraints.
   - `📋 View Table Schema`: Opens column definitions viewer.
@@ -85,14 +87,17 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
   - **Hover Tooltips**: Inspect full cell contents without layout truncation.
 - **In-Memory Row Filter**: Real-time substring filter on loaded rows.
 - **Pagination**: Configurable page sizes (50, 100, 250, 500, 1,000 rows) with Previous/Next controls.
+- **Table Row Editing**: Edit cells and save or revert a row, insert rows with per-column `NULL`/`DEFAULT` choices, and delete rows after confirmation. Updating and deleting are enabled for base tables with a primary key.
 - **CSV Export**: One-click RFC 4180 compliant CSV file export with file-save dialog.
 
 ### 5. Multi-Line SQL Query Editor
-- **Clean Editor**: Monospace font with line padding and code styling.
+- **SQL Syntax Highlighting**: Highlights SQL keywords, strings, numbers, and line comments in the editor.
+- **Schema-Aware Completion**: Press `Ctrl + Space` to complete SQL keywords, loaded table names, qualified schema/table names, and columns from the selected table.
 - **Keyboard Execution**: Run queries with `Ctrl + Enter` (or `F5`).
 - **Performance Timer**: Displays query execution time in milliseconds and row counts (`⚡ 3.4 ms | 120 rows returned`).
 - **Quick Snippets**: Dropdown with ready-to-use SQL templates (Server Info, Database Sizes, Table Counts, etc.).
-- **Session History**: Remembers recently executed queries in a history dropdown.
+- **pgAdmin-Style Admin Insights**: One-click query plans (`EXPLAIN`, without executing the query), active sessions, blocked sessions, database statistics, and database roles in the normal result grid.
+- **Persistent Query History**: Keeps the latest 200 distinct queries in the app configuration, with search, load-into-editor, and copy actions.
 - **Error Reporting**: Clear, highlighted PostgreSQL error banners when syntax or constraints fail.
 
 ### 6. Table Schema / Column Inspector
@@ -117,6 +122,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 | Shortcut | Action |
 | :--- | :--- |
 | `Ctrl + Enter` / `F5` | Execute current SQL query in the editor |
+| `Ctrl + Space` | Open SQL and schema completion suggestions |
 | `Click on Cell` | Copy cell value to clipboard |
 | `Hover on Cell` | View full value tooltip |
 
@@ -199,6 +205,7 @@ postgresql-manager/
 - **GUI Framework**: [`egui`](https://github.com/emilk/egui) / [`eframe`](https://docs.rs/eframe) (v0.29) with hardware-accelerated OpenGL / Glow rendering.
 - **PostgreSQL Client**: [`tokio-postgres`](https://docs.rs/tokio-postgres) (pure asynchronous wire-protocol implementation in Rust, without external C `libpq` dependencies).
 - **Concurrency**: Messages between the GUI and the database worker are exchanged asynchronously over standard channels, ensuring zero UI freezes during query execution.
+- **Object Catalogs**: The browser queries PostgreSQL `pg_catalog`; each expanded object group is loaded asynchronously through the existing database worker.
 - **Configuration**: JSON-serialized settings stored in standard XDG config directories via `dirs`.
 
 ---

@@ -1,10 +1,10 @@
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 use crate::models::{
     AddColumnForm, CellValue, ColumnItem, ConnectionConfig, CreateTableForm, DatabaseItem,
-    QueryResult, TableItem,
+    DbObjectItem, DbObjectKind, DbObjectRef, EditableCell, ObjectTreeKey, QueryResult, TableItem,
 };
 
 #[derive(Debug)]
@@ -13,6 +13,13 @@ pub enum DbRequest {
     Disconnect,
     FetchDatabases,
     SwitchDatabase(String),
+    FetchSchemas {
+        database: String,
+    },
+    FetchObjects {
+        database: String,
+        key: ObjectTreeKey,
+    },
     FetchTables,
     FetchTableData {
         schema: String,
@@ -43,6 +50,27 @@ pub enum DbRequest {
     DropDatabase {
         db_name: String,
     },
+    DropObject(DbObjectRef),
+    RenameObject {
+        object: DbObjectRef,
+        new_name: String,
+    },
+    UpdateRow {
+        schema: String,
+        table: String,
+        primary_key: Vec<(String, CellValue)>,
+        values: Vec<(String, EditableCell)>,
+    },
+    InsertRow {
+        schema: String,
+        table: String,
+        values: Vec<(String, EditableCell)>,
+    },
+    DeleteRow {
+        schema: String,
+        table: String,
+        primary_key: Vec<(String, CellValue)>,
+    },
 }
 
 #[derive(Debug)]
@@ -55,6 +83,15 @@ pub enum DbResponse {
     ConnectionFailed(String),
     Disconnected,
     DatabasesFetched(Result<Vec<DatabaseItem>, String>),
+    SchemasFetched {
+        database: String,
+        result: Result<Vec<String>, String>,
+    },
+    ObjectsFetched {
+        database: String,
+        key: ObjectTreeKey,
+        result: Result<Vec<DbObjectItem>, String>,
+    },
     DatabaseSwitched {
         db_name: String,
         server_version: String,
@@ -157,6 +194,39 @@ impl DbWorker {
                                     let _ = res_tx.send(DbResponse::Busy(false));
                                 }
                             }
+                            DbRequest::FetchSchemas { database } => {
+                                let result = match (&current_client, &current_cfg) {
+                                    (Some(client), Some(cfg)) if cfg.database == database => {
+                                        let _ = res_tx.send(DbResponse::Busy(true));
+                                        fetch_schemas_impl(client).await
+                                    }
+                                    _ => Err(format!(
+                                        "Connect to database '{}' before browsing its schemas",
+                                        database
+                                    )),
+                                };
+                                let _ =
+                                    res_tx.send(DbResponse::SchemasFetched { database, result });
+                                let _ = res_tx.send(DbResponse::Busy(false));
+                            }
+                            DbRequest::FetchObjects { database, key } => {
+                                let result = match (&current_client, &current_cfg) {
+                                    (Some(client), Some(cfg)) if cfg.database == database => {
+                                        let _ = res_tx.send(DbResponse::Busy(true));
+                                        fetch_objects_impl(client, &key).await
+                                    }
+                                    _ => Err(format!(
+                                        "Connect to database '{}' before browsing its objects",
+                                        database
+                                    )),
+                                };
+                                let _ = res_tx.send(DbResponse::ObjectsFetched {
+                                    database,
+                                    key,
+                                    result,
+                                });
+                                let _ = res_tx.send(DbResponse::Busy(false));
+                            }
                             DbRequest::FetchTables => {
                                 if let Some(client) = &current_client {
                                     let _ = res_tx.send(DbResponse::Busy(true));
@@ -173,9 +243,10 @@ impl DbWorker {
                             } => {
                                 if let Some(client) = &current_client {
                                     let _ = res_tx.send(DbResponse::Busy(true));
-                                    let result =
-                                        fetch_table_data_impl(client, &schema, &table, limit, offset)
-                                            .await;
+                                    let result = fetch_table_data_impl(
+                                        client, &schema, &table, limit, offset,
+                                    )
+                                    .await;
                                     let _ = res_tx.send(DbResponse::TableDataResult(result));
                                     let _ = res_tx.send(DbResponse::Busy(false));
                                 }
@@ -183,8 +254,7 @@ impl DbWorker {
                             DbRequest::FetchColumns { schema, table } => {
                                 if let Some(client) = &current_client {
                                     let _ = res_tx.send(DbResponse::Busy(true));
-                                    let result =
-                                        fetch_columns_impl(client, &schema, &table).await;
+                                    let result = fetch_columns_impl(client, &schema, &table).await;
                                     let _ = res_tx.send(DbResponse::ColumnsFetched(result));
                                     let _ = res_tx.send(DbResponse::Busy(false));
                                 }
@@ -250,13 +320,18 @@ impl DbWorker {
                                     match client.simple_query(&sql).await {
                                         Ok(_) => {
                                             let _ = res_tx.send(DbResponse::OperationSuccess {
-                                                message: format!("Table {}.{} dropped successfully", schema, table),
+                                                message: format!(
+                                                    "Table {}.{} dropped successfully",
+                                                    schema, table
+                                                ),
                                                 refresh_tables: true,
                                                 refresh_columns: false,
                                             });
                                         }
                                         Err(e) => {
-                                            let _ = res_tx.send(DbResponse::OperationFailed(format!("Failed to drop table: {}", e)));
+                                            let _ = res_tx.send(DbResponse::OperationFailed(
+                                                format!("Failed to drop table: {}", e),
+                                            ));
                                         }
                                     }
                                     let _ = res_tx.send(DbResponse::Busy(false));
@@ -273,19 +348,28 @@ impl DbWorker {
                                     match client.simple_query(&sql).await {
                                         Ok(_) => {
                                             let _ = res_tx.send(DbResponse::OperationSuccess {
-                                                message: format!("Table {}.{} truncated successfully", schema, table),
+                                                message: format!(
+                                                    "Table {}.{} truncated successfully",
+                                                    schema, table
+                                                ),
                                                 refresh_tables: false,
                                                 refresh_columns: false,
                                             });
                                         }
                                         Err(e) => {
-                                            let _ = res_tx.send(DbResponse::OperationFailed(format!("Failed to truncate table: {}", e)));
+                                            let _ = res_tx.send(DbResponse::OperationFailed(
+                                                format!("Failed to truncate table: {}", e),
+                                            ));
                                         }
                                     }
                                     let _ = res_tx.send(DbResponse::Busy(false));
                                 }
                             }
-                            DbRequest::DropColumn { schema, table, column } => {
+                            DbRequest::DropColumn {
+                                schema,
+                                table,
+                                column,
+                            } => {
                                 if let Some(client) = &current_client {
                                     let _ = res_tx.send(DbResponse::Busy(true));
                                     let sql = format!(
@@ -297,13 +381,18 @@ impl DbWorker {
                                     match client.simple_query(&sql).await {
                                         Ok(_) => {
                                             let _ = res_tx.send(DbResponse::OperationSuccess {
-                                                message: format!("Column {} dropped from {}.{}", column, schema, table),
+                                                message: format!(
+                                                    "Column {} dropped from {}.{}",
+                                                    column, schema, table
+                                                ),
                                                 refresh_tables: false,
                                                 refresh_columns: true,
                                             });
                                         }
                                         Err(e) => {
-                                            let _ = res_tx.send(DbResponse::OperationFailed(format!("Failed to drop column: {}", e)));
+                                            let _ = res_tx.send(DbResponse::OperationFailed(
+                                                format!("Failed to drop column: {}", e),
+                                            ));
                                         }
                                     }
                                     let _ = res_tx.send(DbResponse::Busy(false));
@@ -319,13 +408,173 @@ impl DbWorker {
                                     match client.simple_query(&sql).await {
                                         Ok(_) => {
                                             let _ = res_tx.send(DbResponse::OperationSuccess {
-                                                message: format!("Database {} dropped successfully", db_name),
+                                                message: format!(
+                                                    "Database {} dropped successfully",
+                                                    db_name
+                                                ),
                                                 refresh_tables: true,
                                                 refresh_columns: false,
                                             });
                                         }
                                         Err(e) => {
-                                            let _ = res_tx.send(DbResponse::OperationFailed(format!("Failed to drop database: {}", e)));
+                                            let _ = res_tx.send(DbResponse::OperationFailed(
+                                                format!("Failed to drop database: {}", e),
+                                            ));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::DropObject(object) => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    match client.simple_query(&object.drop_sql()).await {
+                                        Ok(_) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: format!(
+                                                    "{} '{}' deleted successfully",
+                                                    object.kind.singular(),
+                                                    object.qualified_name()
+                                                ),
+                                                refresh_tables: true,
+                                                refresh_columns: false,
+                                            });
+                                        }
+                                        Err(err) => {
+                                            let _ =
+                                                res_tx.send(DbResponse::OperationFailed(format!(
+                                                    "Failed to delete {}: {}",
+                                                    object.kind.singular(),
+                                                    err
+                                                )));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::RenameObject { object, new_name } => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    let result = match object.rename_sql(new_name.trim()) {
+                                        Some(sql) if !new_name.trim().is_empty() => client
+                                            .simple_query(&sql)
+                                            .await
+                                            .map(|_| ())
+                                            .map_err(|err| err.to_string()),
+                                        Some(_) => {
+                                            Err("The new object name cannot be empty".to_string())
+                                        }
+                                        None => Err(format!(
+                                            "PostgreSQL does not support renaming {} objects",
+                                            object.kind.singular().to_lowercase()
+                                        )),
+                                    };
+                                    match result {
+                                        Ok(()) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: format!(
+                                                    "{} '{}' renamed to '{}'",
+                                                    object.kind.singular(),
+                                                    object.name,
+                                                    new_name.trim()
+                                                ),
+                                                refresh_tables: true,
+                                                refresh_columns: false,
+                                            });
+                                        }
+                                        Err(err) => {
+                                            let _ =
+                                                res_tx.send(DbResponse::OperationFailed(format!(
+                                                    "Failed to rename {}: {}",
+                                                    object.kind.singular().to_lowercase(),
+                                                    err
+                                                )));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::UpdateRow {
+                                schema,
+                                table,
+                                primary_key,
+                                values,
+                            } => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    match update_row_impl(
+                                        client,
+                                        &schema,
+                                        &table,
+                                        &primary_key,
+                                        &values,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: format!(
+                                                    "Row updated in {}.{}",
+                                                    schema, table
+                                                ),
+                                                refresh_tables: false,
+                                                refresh_columns: true,
+                                            });
+                                        }
+                                        Err(err) => {
+                                            let _ = res_tx.send(DbResponse::OperationFailed(err));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::InsertRow {
+                                schema,
+                                table,
+                                values,
+                            } => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    match insert_row_impl(client, &schema, &table, &values).await {
+                                        Ok(()) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: format!(
+                                                    "Row inserted into {}.{}",
+                                                    schema, table
+                                                ),
+                                                refresh_tables: false,
+                                                refresh_columns: true,
+                                            });
+                                        }
+                                        Err(err) => {
+                                            let _ = res_tx.send(DbResponse::OperationFailed(err));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::DeleteRow {
+                                schema,
+                                table,
+                                primary_key,
+                            } => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    match delete_row_impl(client, &schema, &table, &primary_key)
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: format!(
+                                                    "Row deleted from {}.{}",
+                                                    schema, table
+                                                ),
+                                                refresh_tables: false,
+                                                refresh_columns: true,
+                                            });
+                                        }
+                                        Err(err) => {
+                                            let _ = res_tx.send(DbResponse::OperationFailed(err));
                                         }
                                     }
                                     let _ = res_tx.send(DbResponse::Busy(false));
@@ -452,6 +701,112 @@ async fn fetch_tables_impl(client: &Client) -> Result<Vec<TableItem>, String> {
     Ok(tables)
 }
 
+async fn fetch_schemas_impl(client: &Client) -> Result<Vec<String>, String> {
+    let rows = client
+        .simple_query(
+            "SELECT nspname FROM pg_catalog.pg_namespace \
+             WHERE nspname NOT IN ('pg_catalog', 'information_schema') \
+               AND nspname NOT LIKE 'pg_toast%' \
+             ORDER BY nspname;",
+        )
+        .await
+        .map_err(|err| format!("Failed to fetch schemas: {}", err))?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+            _ => None,
+        })
+        .collect())
+}
+
+async fn fetch_objects_impl(
+    client: &Client,
+    key: &ObjectTreeKey,
+) -> Result<Vec<DbObjectItem>, String> {
+    let schema = key.schema.as_deref().unwrap_or("");
+    let schema_literal = escape_sql_literal(schema);
+    let sql = match key.kind {
+        DbObjectKind::Database => {
+            return Err("Databases are loaded from the server's database list".to_string());
+        }
+        DbObjectKind::Table => format!(
+            "SELECT c.relname, NULL::text FROM pg_catalog.pg_class AS c \
+             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace \
+             WHERE n.nspname = '{schema_literal}' AND c.relkind IN ('r', 'p') \
+             ORDER BY c.relname;"
+        ),
+        DbObjectKind::View => format!(
+            "SELECT c.relname, NULL::text FROM pg_catalog.pg_class AS c \
+             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace \
+             WHERE n.nspname = '{schema_literal}' AND c.relkind = 'v' \
+             ORDER BY c.relname;"
+        ),
+        DbObjectKind::MaterializedView => format!(
+            "SELECT c.relname, NULL::text FROM pg_catalog.pg_class AS c \
+             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace \
+             WHERE n.nspname = '{schema_literal}' AND c.relkind = 'm' \
+             ORDER BY c.relname;"
+        ),
+        DbObjectKind::Sequence => format!(
+            "SELECT c.relname, NULL::text FROM pg_catalog.pg_class AS c \
+             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace \
+             WHERE n.nspname = '{schema_literal}' AND c.relkind = 'S' \
+             ORDER BY c.relname;"
+        ),
+        DbObjectKind::Function | DbObjectKind::Procedure => {
+            let prokind = if key.kind == DbObjectKind::Function {
+                "f"
+            } else {
+                "p"
+            };
+            format!(
+                "SELECT p.proname, pg_catalog.pg_get_function_identity_arguments(p.oid) \
+                 FROM pg_catalog.pg_proc AS p \
+                 JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = '{schema_literal}' AND p.prokind = '{prokind}' \
+                 ORDER BY p.proname, 2;"
+            )
+        }
+        DbObjectKind::Type => format!(
+            "SELECT t.typname, NULL::text FROM pg_catalog.pg_type AS t \
+             JOIN pg_catalog.pg_namespace AS n ON n.oid = t.typnamespace \
+             LEFT JOIN pg_catalog.pg_class AS c ON c.oid = t.typrelid \
+             WHERE n.nspname = '{schema_literal}' AND t.typisdefined \
+               AND t.typtype IN ('b', 'c', 'd', 'e', 'm', 'r') \
+               AND (c.oid IS NULL OR c.relkind NOT IN ('r', 'p', 'v', 'm', 'f')) \
+             ORDER BY t.typname;"
+        ),
+        DbObjectKind::Extension => {
+            "SELECT e.extname, NULL::text FROM pg_catalog.pg_extension AS e ORDER BY e.extname;"
+                .to_string()
+        }
+        DbObjectKind::Schema => {
+            return Err("Schemas are loaded with the database's schema list".to_string());
+        }
+    };
+
+    let rows = client.simple_query(&sql).await.map_err(|err| {
+        format!(
+            "Failed to fetch {}: {}",
+            key.kind.label().to_lowercase(),
+            err
+        )
+    })?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(|name| DbObjectItem {
+                name: name.to_string(),
+                identity_arguments: row.get(1).map(str::to_string),
+            }),
+            _ => None,
+        })
+        .collect())
+}
+
 async fn fetch_columns_impl(
     client: &Client,
     schema: &str,
@@ -493,7 +848,10 @@ async fn fetch_columns_impl(
         if let SimpleQueryMessage::Row(row) = msg {
             let name = row.get(0).unwrap_or("").to_string();
             let data_type = row.get(1).unwrap_or("").to_string();
-            let is_nullable = row.get(2).map(|s| s.eq_ignore_ascii_case("YES")).unwrap_or(true);
+            let is_nullable = row
+                .get(2)
+                .map(|s| s.eq_ignore_ascii_case("YES"))
+                .unwrap_or(true);
             let default_value = row.get(3).map(|s| s.to_string());
             let is_primary_key = row.get(4).map(|s| s == "t" || s == "true").unwrap_or(false);
 
@@ -662,4 +1020,165 @@ fn escape_sql_ident(ident: &str) -> String {
 
 fn escape_sql_literal(literal: &str) -> String {
     literal.replace('\'', "''")
+}
+
+fn edited_cell_sql(cell: &EditableCell) -> Result<String, String> {
+    if cell.use_default {
+        return Ok("DEFAULT".to_string());
+    }
+    if cell.is_null {
+        return Ok("NULL".to_string());
+    }
+    Ok(escape_sql_value(&cell.text))
+}
+
+fn escape_sql_value(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("E'{}'", escaped)
+}
+
+fn primary_key_predicate(primary_key: &[(String, CellValue)]) -> Result<String, String> {
+    if primary_key.is_empty() {
+        return Err(
+            "This table has no primary key; row updates and deletes are disabled.".to_string(),
+        );
+    }
+    Ok(primary_key
+        .iter()
+        .map(|(name, value)| {
+            let ident = format!("\"{}\"", escape_sql_ident(name));
+            if value.is_null {
+                format!("{} IS NULL", ident)
+            } else {
+                format!(
+                    "{} IS NOT DISTINCT FROM {}",
+                    ident,
+                    escape_sql_value(&value.text)
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND "))
+}
+
+async fn update_row_impl(
+    client: &Client,
+    schema: &str,
+    table: &str,
+    primary_key: &[(String, CellValue)],
+    values: &[(String, EditableCell)],
+) -> Result<(), String> {
+    if values.is_empty() {
+        return Err("No changed values to save.".to_string());
+    }
+    let assignments = values
+        .iter()
+        .map(|(name, value)| {
+            Ok(format!(
+                "\"{}\" = {}",
+                escape_sql_ident(name),
+                edited_cell_sql(value)?
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .join(", ");
+    let predicate = primary_key_predicate(primary_key)?;
+    let sql = format!(
+        "UPDATE \"{}\".\"{}\" SET {} WHERE {};",
+        escape_sql_ident(schema),
+        escape_sql_ident(table),
+        assignments,
+        predicate
+    );
+    execute_single_row_mutation(client, &sql, "update").await
+}
+
+async fn insert_row_impl(
+    client: &Client,
+    schema: &str,
+    table: &str,
+    values: &[(String, EditableCell)],
+) -> Result<(), String> {
+    let supplied: Vec<_> = values
+        .iter()
+        .filter(|(_, value)| !value.use_default)
+        .collect();
+    let sql = if supplied.is_empty() {
+        format!(
+            "INSERT INTO \"{}\".\"{}\" DEFAULT VALUES;",
+            escape_sql_ident(schema),
+            escape_sql_ident(table)
+        )
+    } else {
+        let names = supplied
+            .iter()
+            .map(|(name, _)| format!("\"{}\"", escape_sql_ident(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let vals = supplied
+            .iter()
+            .map(|(_, value)| edited_cell_sql(value))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+        format!(
+            "INSERT INTO \"{}\".\"{}\" ({}) VALUES ({});",
+            escape_sql_ident(schema),
+            escape_sql_ident(table),
+            names,
+            vals
+        )
+    };
+    client
+        .simple_query(&sql)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("Failed to insert row: {}", e))
+}
+
+async fn delete_row_impl(
+    client: &Client,
+    schema: &str,
+    table: &str,
+    primary_key: &[(String, CellValue)],
+) -> Result<(), String> {
+    let predicate = primary_key_predicate(primary_key)?;
+    let sql = format!(
+        "DELETE FROM \"{}\".\"{}\" WHERE {};",
+        escape_sql_ident(schema),
+        escape_sql_ident(table),
+        predicate
+    );
+    execute_single_row_mutation(client, &sql, "delete").await
+}
+
+async fn execute_single_row_mutation(
+    client: &Client,
+    sql: &str,
+    operation: &str,
+) -> Result<(), String> {
+    let messages = client
+        .simple_query(sql)
+        .await
+        .map_err(|e| format!("Failed to {} row: {}", operation, e))?;
+    let affected = messages
+        .into_iter()
+        .find_map(|message| match message {
+            SimpleQueryMessage::CommandComplete(count) => Some(count),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if affected != 1 {
+        return Err(if affected == 0 {
+            format!(
+                "Could not {} row: it may have been changed or deleted by another session.",
+                operation
+            )
+        } else {
+            format!(
+                "Refusing to {} row: primary-key match affected {} rows.",
+                operation, affected
+            )
+        });
+    }
+    Ok(())
 }

@@ -1,15 +1,16 @@
-use std::time::{Duration, Instant};
 use egui::{CentralPanel, Color32, RichText, SidePanel, TopBottomPanel};
+use std::time::{Duration, Instant};
 
 use crate::config::ConfigManager;
 use crate::db::{DbRequest, DbResponse, DbWorker};
 use crate::models::{
-    AppConfig, ColumnItem, ConfirmAction, ConfirmDialogState, DatabaseItem, QueryResult, TableItem,
+    AppConfig, CellValue, ColumnItem, ConfirmAction, ConfirmDialogState, DatabaseItem,
+    DbObjectKind, DbObjectRef, EditableCell, QueryResult, TableItem,
 };
-use crate::ui::columns_view::{render_columns_view, ColumnsViewAction};
+use crate::ui::columns_view::{ColumnsViewAction, render_columns_view};
 use crate::ui::connection_modal::ConnectionModal;
-use crate::ui::data_table::{export_to_csv, render_data_table, DataTableAction, DataTableState};
-use crate::ui::dialogs::{render_confirm_dialog, AddColumnModal, CreateTableModal};
+use crate::ui::data_table::{DataTableAction, DataTableState, export_to_csv, render_data_table};
+use crate::ui::dialogs::{AddColumnModal, CreateTableModal, render_confirm_dialog};
 use crate::ui::sidebar::{Sidebar, SidebarAction};
 use crate::ui::sql_editor::{SqlEditor, SqlEditorAction};
 use crate::ui::theme::setup_custom_theme;
@@ -52,6 +53,8 @@ pub struct PgMiniApp {
     add_column_modal: AddColumnModal,
     create_table_modal: CreateTableModal,
     confirm_dialog: ConfirmDialogState,
+    rename_object: Option<DbObjectRef>,
+    rename_object_name: String,
 
     // UI State
     active_tab: ActiveTab,
@@ -71,9 +74,17 @@ impl PgMiniApp {
             .iter()
             .find(|c| Some(&c.id) == config.last_connection_id.as_ref())
             .cloned()
-            .unwrap_or_else(|| config.saved_connections.first().cloned().unwrap_or_default());
+            .unwrap_or_else(|| {
+                config
+                    .saved_connections
+                    .first()
+                    .cloned()
+                    .unwrap_or_default()
+            });
 
         let connection_modal = ConnectionModal::new(initial_cfg);
+        let mut sql_editor = SqlEditor::default();
+        sql_editor.history = config.query_history.clone();
 
         Self {
             config,
@@ -89,11 +100,13 @@ impl PgMiniApp {
             current_table_data: None,
             table_data_state: DataTableState::default(),
             current_columns: Vec::new(),
-            sql_editor: SqlEditor::default(),
+            sql_editor,
             last_query_result: None,
             add_column_modal: AddColumnModal::default(),
             create_table_modal: CreateTableModal::default(),
             confirm_dialog: ConfirmDialogState::default(),
+            rename_object: None,
+            rename_object_name: String::new(),
             active_tab: ActiveTab::SqlEditor,
             sidebar: Sidebar::default(),
             toast: None,
@@ -121,10 +134,12 @@ impl PgMiniApp {
                     self.current_db = current_db.clone();
                     self.host_port = host_port.clone();
                     self.connection_modal.is_open = false;
-                    self.show_toast(format!("Connected to {} on {}", current_db, host_port), false);
-                    // Fetch both databases and tables automatically on connect
+                    self.show_toast(
+                        format!("Connected to {} on {}", current_db, host_port),
+                        false,
+                    );
+                    self.sidebar.reset_object_tree();
                     self.db_worker.send(DbRequest::FetchDatabases);
-                    self.db_worker.send(DbRequest::FetchTables);
                 }
                 DbResponse::ConnectionFailed(err) => {
                     self.is_connected = false;
@@ -139,16 +154,55 @@ impl PgMiniApp {
                     self.current_table_data = None;
                     self.current_columns.clear();
                     self.last_query_result = None;
+                    self.sidebar.reset_object_tree();
                     self.show_toast("Disconnected from PostgreSQL", false);
                 }
-                DbResponse::DatabasesFetched(res) => {
-                    match res {
-                        Ok(dbs) => {
-                            self.databases = dbs;
+                DbResponse::DatabasesFetched(res) => match res {
+                    Ok(dbs) => {
+                        self.databases = dbs;
+                    }
+                    Err(e) => {
+                        self.show_toast(format!("Error fetching databases: {}", e), true);
+                    }
+                },
+                DbResponse::SchemasFetched { database, result } => {
+                    if database == self.current_db {
+                        if let Err(error) = &result {
+                            self.show_toast(format!("Error fetching schemas: {}", error), true);
                         }
-                        Err(e) => {
-                            self.show_toast(format!("Error fetching databases: {}", e), true);
+                        self.sidebar.receive_schemas(result);
+                    }
+                }
+                DbResponse::ObjectsFetched {
+                    database,
+                    key,
+                    result,
+                } => {
+                    if database == self.current_db {
+                        if let Err(error) = &result {
+                            self.show_toast(format!("Error fetching objects: {}", error), true);
                         }
+                        if let Ok(objects) = &result {
+                            if let Some(schema) = key.schema.as_deref() {
+                                let table_type = match key.kind {
+                                    DbObjectKind::Table => Some("BASE TABLE"),
+                                    DbObjectKind::View => Some("VIEW"),
+                                    DbObjectKind::MaterializedView => Some("MATERIALIZED VIEW"),
+                                    _ => None,
+                                };
+                                if let Some(table_type) = table_type {
+                                    self.tables.retain(|table| {
+                                        table.schema != schema || table.table_type != table_type
+                                    });
+                                    self.tables.extend(objects.iter().map(|object| TableItem {
+                                        schema: schema.to_string(),
+                                        name: object.name.clone(),
+                                        table_type: table_type.to_string(),
+                                    }));
+                                }
+                            }
+                        }
+                        self.sidebar.receive_objects(&key, result);
                     }
                 }
                 DbResponse::DatabaseSwitched {
@@ -159,43 +213,41 @@ impl PgMiniApp {
                     self.selected_table = None;
                     self.current_table_data = None;
                     self.current_columns.clear();
+                    self.table_data_state.editing_row = None;
+                    self.table_data_state.adding_row = None;
+                    self.table_data_state.mutation_pending = false;
+                    self.tables.clear();
+                    self.sidebar.reset_object_tree();
                     self.show_toast(format!("Switched to database '{}'", db_name), false);
-                    // Refresh both databases and tables
+                    // Object catalogs are fetched when their tree nodes are expanded.
                     self.db_worker.send(DbRequest::FetchDatabases);
-                    self.db_worker.send(DbRequest::FetchTables);
                 }
-                DbResponse::TablesFetched(res) => {
-                    match res {
-                        Ok(tables) => {
-                            self.tables = tables;
-                        }
-                        Err(e) => {
-                            self.show_toast(format!("Error fetching tables: {}", e), true);
-                        }
+                DbResponse::TablesFetched(res) => match res {
+                    Ok(tables) => {
+                        self.tables = tables;
                     }
-                }
-                DbResponse::TableDataResult(res) => {
-                    match res {
-                        Ok(data) => {
-                            self.current_table_data = Some(data);
-                            self.active_tab = ActiveTab::TableView;
-                        }
-                        Err(e) => {
-                            self.show_toast(format!("Error fetching data: {}", e), true);
-                        }
+                    Err(e) => {
+                        self.show_toast(format!("Error fetching tables: {}", e), true);
                     }
-                }
-                DbResponse::ColumnsFetched(res) => {
-                    match res {
-                        Ok((schema, table, columns)) => {
-                            self.selected_table = Some((schema, table));
-                            self.current_columns = columns;
-                        }
-                        Err(e) => {
-                            self.show_toast(format!("Error fetching schema: {}", e), true);
-                        }
+                },
+                DbResponse::TableDataResult(res) => match res {
+                    Ok(data) => {
+                        self.current_table_data = Some(data);
+                        self.active_tab = ActiveTab::TableView;
                     }
-                }
+                    Err(e) => {
+                        self.show_toast(format!("Error fetching data: {}", e), true);
+                    }
+                },
+                DbResponse::ColumnsFetched(res) => match res {
+                    Ok((schema, table, columns)) => {
+                        self.selected_table = Some((schema, table));
+                        self.current_columns = columns;
+                    }
+                    Err(e) => {
+                        self.show_toast(format!("Error fetching schema: {}", e), true);
+                    }
+                },
                 DbResponse::QueryResult(res) => {
                     self.last_query_result = Some(res);
                     self.active_tab = ActiveTab::SqlEditor;
@@ -207,16 +259,22 @@ impl PgMiniApp {
                 } => {
                     self.show_toast(message, false);
                     if refresh_tables {
-                        self.db_worker.send(DbRequest::FetchTables);
+                        self.tables.clear();
+                        self.sidebar.reset_object_tree();
+                        self.db_worker.send(DbRequest::FetchDatabases);
                     }
                     if refresh_columns {
+                        self.table_data_state.editing_row = None;
+                        self.table_data_state.adding_row = None;
+                        self.table_data_state.mutation_pending = false;
                         if let Some((ref s, ref t)) = self.selected_table {
                             self.db_worker.send(DbRequest::FetchColumns {
                                 schema: s.clone(),
                                 table: t.clone(),
                             });
                             // Also refresh table data if open
-                            let offset = self.table_data_state.current_page * self.table_data_state.page_limit;
+                            let offset = self.table_data_state.current_page
+                                * self.table_data_state.page_limit;
                             self.db_worker.send(DbRequest::FetchTableData {
                                 schema: s.clone(),
                                 table: t.clone(),
@@ -227,6 +285,7 @@ impl PgMiniApp {
                     }
                 }
                 DbResponse::OperationFailed(err) => {
+                    self.table_data_state.mutation_pending = false;
                     self.show_toast(err, true);
                 }
                 DbResponse::Busy(busy) => {
@@ -246,26 +305,44 @@ impl eframe::App for PgMiniApp {
         TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.add_space(3.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("⚡ pg-mini").strong().size(18.0).color(Color32::from_rgb(80, 180, 255)));
-                ui.label(RichText::new("Lightweight PostgreSQL Manager").size(11.0).color(Color32::GRAY));
+                ui.label(
+                    RichText::new("⚡ pg-mini")
+                        .strong()
+                        .size(18.0)
+                        .color(Color32::from_rgb(80, 180, 255)),
+                );
+                ui.label(
+                    RichText::new("Lightweight PostgreSQL Manager")
+                        .size(11.0)
+                        .color(Color32::GRAY),
+                );
 
                 ui.separator();
 
                 // Connection badge
                 if self.is_connected {
                     ui.label(RichText::new("●").color(Color32::from_rgb(50, 220, 80)));
-                    ui.label(RichText::new(format!("{}/{}", self.host_port, self.current_db)).strong());
+                    ui.label(
+                        RichText::new(format!("{}/{}", self.host_port, self.current_db)).strong(),
+                    );
                     if ui.button("🔌 Disconnect").clicked() {
                         self.db_worker.send(DbRequest::Disconnect);
                     }
                 } else {
                     ui.label(RichText::new("●").color(Color32::from_rgb(220, 50, 50)));
                     ui.label(RichText::new("Disconnected").color(Color32::GRAY));
-                    if ui.add(
-                        egui::Button::new(RichText::new("🔌 Connect...").strong().color(Color32::WHITE))
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("🔌 Connect...")
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
                             .fill(Color32::from_rgb(16, 145, 90))
                             .rounding(egui::Rounding::same(6.0)),
-                    ).clicked() {
+                        )
+                        .clicked()
+                    {
                         self.connection_modal.is_open = true;
                     }
                 }
@@ -280,7 +357,11 @@ impl eframe::App for PgMiniApp {
                     }
 
                     // Theme toggle
-                    let theme_icon = if self.config.dark_mode { "☀ Light" } else { "🌙 Dark" };
+                    let theme_icon = if self.config.dark_mode {
+                        "☀ Light"
+                    } else {
+                        "🌙 Dark"
+                    };
                     if ui.button(theme_icon).clicked() {
                         self.config.dark_mode = !self.config.dark_mode;
                         setup_custom_theme(ctx, self.config.dark_mode);
@@ -305,7 +386,10 @@ impl eframe::App for PgMiniApp {
                     }
                 } else {
                     let status_txt = if self.is_connected {
-                        format!("Connected: {} | Active DB: {}", self.host_port, self.current_db)
+                        format!(
+                            "Connected: {} | Active DB: {}",
+                            self.host_port, self.current_db
+                        )
                     } else {
                         "Ready | Click 'Connect...' to start".to_string()
                     };
@@ -322,17 +406,17 @@ impl eframe::App for PgMiniApp {
             });
         });
 
-        // Left Sidebar: Databases, Tables & Views Explorer
+        // Left Sidebar: lazy PostgreSQL object browser
         SidePanel::left("left_sidebar")
             .resizable(true)
             .default_width(260.0)
             .width_range(180.0..=450.0)
             .show(ctx, |ui| {
-                if let Some(action) = self.sidebar.show(
+                if let Some(action) = self.sidebar.show_object_browser(
                     ui,
                     &self.databases,
-                    &self.tables,
                     &self.current_db,
+                    &self.host_port,
                     self.is_connected,
                     self.is_busy,
                 ) {
@@ -345,6 +429,9 @@ impl eframe::App for PgMiniApp {
                         }
                         SidebarAction::SelectTable { schema, table, limit } => {
                             self.selected_table = Some((schema.clone(), table.clone()));
+                            self.current_columns.clear();
+                            self.table_data_state.editing_row = None;
+                            self.table_data_state.adding_row = None;
                             self.table_data_state.page_limit = limit;
                             self.table_data_state.current_page = 0;
                             self.db_worker.send(DbRequest::FetchTableData {
@@ -356,9 +443,15 @@ impl eframe::App for PgMiniApp {
                             self.db_worker.send(DbRequest::FetchColumns { schema, table });
                         }
                         SidebarAction::CountRows { schema, table } => {
+                            let object = DbObjectRef {
+                                kind: DbObjectKind::Table,
+                                schema: Some(schema),
+                                name: table,
+                                identity_arguments: None,
+                            };
                             self.db_worker.send(DbRequest::ExecuteSql(format!(
-                                "SELECT count(*) AS total_rows FROM \"{}\".\"{}\";",
-                                schema, table
+                                "SELECT count(*) AS total_rows FROM {};",
+                                object.qualified_name()
                             )));
                             self.active_tab = ActiveTab::SqlEditor;
                         }
@@ -408,7 +501,45 @@ impl eframe::App for PgMiniApp {
                             };
                         }
                         SidebarAction::RefreshTables => {
-                            self.db_worker.send(DbRequest::FetchTables);
+                            self.tables.clear();
+                            self.sidebar.reset_object_tree();
+                            self.db_worker.send(DbRequest::FetchDatabases);
+                        }
+                        SidebarAction::RequestSchemas { database } => {
+                            self.db_worker.send(DbRequest::FetchSchemas { database });
+                        }
+                        SidebarAction::RequestObjects { database, key } => {
+                            self.db_worker
+                                .send(DbRequest::FetchObjects { database, key });
+                        }
+                        SidebarAction::RefreshDatabaseTree => {
+                            self.tables.clear();
+                            self.sidebar.reset_object_tree();
+                            self.db_worker.send(DbRequest::FetchDatabases);
+                        }
+                        SidebarAction::RefreshObjects { database, key } => {
+                            self.db_worker
+                                .send(DbRequest::FetchObjects { database, key });
+                        }
+                        SidebarAction::OpenSql(sql) => {
+                            self.sql_editor.sql_text = sql;
+                            self.active_tab = ActiveTab::SqlEditor;
+                        }
+                        SidebarAction::RenameObject(object) => {
+                            self.rename_object_name = object.name.clone();
+                            self.rename_object = Some(object);
+                        }
+                        SidebarAction::ConfirmDropObject(object) => {
+                            self.confirm_dialog = ConfirmDialogState {
+                                is_open: true,
+                                title: format!("Delete {}", object.kind.singular()),
+                                message: format!(
+                                    "Delete {} '{}'?",
+                                    object.kind.singular().to_lowercase(),
+                                    object.qualified_name()
+                                ),
+                                action: Some(ConfirmAction::DropObject { object }),
+                            };
                         }
                     }
                 }
@@ -450,6 +581,11 @@ impl eframe::App for PgMiniApp {
             match self.active_tab {
                 ActiveTab::TableView => {
                     let table_name_label = self.selected_table.as_ref().map(|(s, t)| format!("{}.{}", s, t));
+                    let primary_key_columns: Vec<String> = self.current_columns.iter()
+                        .filter(|column| column.is_primary_key).map(|column| column.name.clone()).collect();
+                    let allow_insert = self.selected_table.as_ref().and_then(|(schema, table)| self.tables.iter()
+                        .find(|item| item.schema == *schema && item.name == *table))
+                        .map(|item| item.table_type == "BASE TABLE").unwrap_or(false);
                     if let Some(ref data) = self.current_table_data {
                         if let Some(action) = render_data_table(
                             ui,
@@ -457,6 +593,8 @@ impl eframe::App for PgMiniApp {
                             data,
                             true,
                             table_name_label.as_deref(),
+                            &primary_key_columns,
+                            allow_insert,
                         ) {
                             match action {
                                 DataTableAction::Refresh => {
@@ -503,6 +641,53 @@ impl eframe::App for PgMiniApp {
                                         }
                                     }
                                 }
+                                DataTableAction::SaveRow { row_index, values } => {
+                                    if let (Some((schema, table)), Some(data_row)) = (&self.selected_table, data.rows.get(row_index)) {
+                                        let changed: Vec<(String, EditableCell)> = values.into_iter().enumerate()
+                                            .filter_map(|(idx, value)| {
+                                                let original = data_row.get(idx)?;
+                                                if value.is_null != original.is_null || (!value.is_null && value.text != original.text) {
+                                                    Some((data.columns.get(idx)?.clone(), value))
+                                                } else { None }
+                                            }).collect();
+                                        let keys: Vec<(String, CellValue)> = primary_key_columns.iter().filter_map(|name| {
+                                            let idx = data.columns.iter().position(|column| column == name)?;
+                                            Some((name.clone(), data_row.get(idx)?.clone()))
+                                        }).collect();
+                                        if changed.is_empty() {
+                                            self.table_data_state.editing_row = None;
+                                            self.table_data_state.mutation_pending = false;
+                                            self.show_toast("No cell values changed", false);
+                                        } else {
+                                            self.db_worker.send(DbRequest::UpdateRow {
+                                                schema: schema.clone(), table: table.clone(), primary_key: keys, values: changed,
+                                            });
+                                        }
+                                    }
+                                }
+                                DataTableAction::InsertRow { values } => {
+                                    if let Some((schema, table)) = &self.selected_table {
+                                        let named_values = data.columns.iter().cloned().zip(values).collect();
+                                        self.db_worker.send(DbRequest::InsertRow {
+                                            schema: schema.clone(), table: table.clone(), values: named_values,
+                                        });
+                                    }
+                                }
+                                DataTableAction::DeleteRow { row_index } => {
+                                    if let (Some((schema, table)), Some(data_row)) = (&self.selected_table, data.rows.get(row_index)) {
+                                        let keys: Vec<(String, CellValue)> = primary_key_columns.iter().filter_map(|name| {
+                                            let idx = data.columns.iter().position(|column| column == name)?;
+                                            Some((name.clone(), data_row.get(idx)?.clone()))
+                                        }).collect();
+                                        self.confirm_dialog = ConfirmDialogState {
+                                            is_open: true,
+                                            title: "Delete Row".to_string(),
+                                            message: format!("Delete this row from {}.{}? This cannot be undone.", schema, table),
+                                            action: Some(ConfirmAction::DeleteRow { schema: schema.clone(), table: table.clone(), primary_key: keys }),
+                                        };
+                                        self.table_data_state.mutation_pending = false;
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -514,11 +699,14 @@ impl eframe::App for PgMiniApp {
                     }
                 }
                 ActiveTab::SqlEditor => {
+                    let previous_history = self.sql_editor.history.clone();
                     if let Some(action) = self.sql_editor.show(
                         ui,
                         &self.last_query_result,
                         self.is_connected,
                         self.is_busy,
+                        &self.tables,
+                        &self.current_columns,
                     ) {
                         match action {
                             SqlEditorAction::ExecuteQuery(query) => {
@@ -543,7 +731,15 @@ impl eframe::App for PgMiniApp {
                                     }
                                 }
                             }
+                            SqlEditorAction::CopyQuery(query) => {
+                                ctx.output_mut(|o| o.copied_text = query);
+                                self.show_toast("Query copied to clipboard", false);
+                            }
                         }
+                    }
+                    if self.sql_editor.history != previous_history {
+                        self.config.query_history = self.sql_editor.history.clone();
+                        ConfigManager::save(&self.config);
                     }
                 }
                 ActiveTab::SchemaView => {
@@ -577,12 +773,10 @@ impl eframe::App for PgMiniApp {
         });
 
         // Modals
-        if let Some(cfg) = self.connection_modal.show(
-            ctx,
-            &mut self.config,
-            self.is_connected,
-            self.is_busy,
-        ) {
+        if let Some(cfg) =
+            self.connection_modal
+                .show(ctx, &mut self.config, self.is_connected, self.is_busy)
+        {
             self.db_worker.send(DbRequest::Connect(cfg));
         }
 
@@ -600,14 +794,80 @@ impl eframe::App for PgMiniApp {
                     self.db_worker.send(DbRequest::DropTable { schema, table });
                 }
                 ConfirmAction::TruncateTable { schema, table } => {
-                    self.db_worker.send(DbRequest::TruncateTable { schema, table });
+                    self.db_worker
+                        .send(DbRequest::TruncateTable { schema, table });
                 }
-                ConfirmAction::DropColumn { schema, table, column } => {
-                    self.db_worker.send(DbRequest::DropColumn { schema, table, column });
+                ConfirmAction::DropColumn {
+                    schema,
+                    table,
+                    column,
+                } => {
+                    self.db_worker.send(DbRequest::DropColumn {
+                        schema,
+                        table,
+                        column,
+                    });
                 }
                 ConfirmAction::DropDatabase { db_name } => {
                     self.db_worker.send(DbRequest::DropDatabase { db_name });
                 }
+                ConfirmAction::DropObject { object } => {
+                    self.db_worker.send(DbRequest::DropObject(object));
+                }
+                ConfirmAction::DeleteRow {
+                    schema,
+                    table,
+                    primary_key,
+                } => {
+                    self.table_data_state.mutation_pending = true;
+                    self.db_worker.send(DbRequest::DeleteRow {
+                        schema,
+                        table,
+                        primary_key,
+                    });
+                }
+            }
+        }
+
+        if let Some(object) = self.rename_object.clone() {
+            let mut keep_open = true;
+            let mut submit_rename = false;
+            let mut cancel_rename = false;
+            egui::Window::new(format!("Rename {}", object.kind.singular()))
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut keep_open)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(format!("Rename '{}':", object.qualified_name()));
+                    ui.text_edit_singleline(&mut self.rename_object_name);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancel_rename = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.is_busy && !self.rename_object_name.trim().is_empty(),
+                                egui::Button::new("Rename"),
+                            )
+                            .clicked()
+                        {
+                            submit_rename = true;
+                        }
+                    });
+                });
+            if submit_rename || cancel_rename {
+                keep_open = false;
+            }
+            if submit_rename {
+                self.db_worker.send(DbRequest::RenameObject {
+                    object,
+                    new_name: self.rename_object_name.trim().to_string(),
+                });
+                keep_open = false;
+            }
+            if !keep_open {
+                self.rename_object = None;
             }
         }
 
