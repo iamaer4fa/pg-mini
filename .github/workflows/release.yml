@@ -105,12 +105,55 @@ jobs:
             target/installer/pg-mini-setup-*-x64.exe
           if-no-files-found: error
 
+  build-macos:
+    name: Build macOS app (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+            os: macos-15
+          - target: x86_64-apple-darwin
+            arch: x64
+            os: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ matrix.target }}
+
+      - name: Verify release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          test "$GITHUB_REF_NAME" = "v$version"
+
+      - name: Build macOS app
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package macOS disk image
+        run: ./packaging/macos/build-dmg.sh "${{ matrix.target }}" "${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pg-mini-macos-${{ matrix.arch }}
+          path: target/macos/*.dmg
+          if-no-files-found: error
+
   publish-release:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/')
     needs:
       - build-linux
       - build-windows
+      - build-macos
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

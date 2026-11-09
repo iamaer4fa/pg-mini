@@ -136,8 +136,9 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 
 ### Prerequisites
 - Linux OS (Ubuntu, Debian, Fedora, Arch, etc.)
-- Windows (Windows 10, Windows 11 with OpenGL 2)
-- Wayland or X11 desktop session
+- Windows 10 or later
+- macOS 11 or later (Apple silicon and Intel Macs)
+- Wayland or X11 desktop session on Linux
 - Rust & Cargo (only if building from source)
 
 ### 1. Quick Launch
@@ -168,7 +169,7 @@ Build a Debian package (including the desktop launcher and lightning icon):
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./target/debian/pg-mini_0.1.3_amd64.deb
+sudo apt install ./target/debian/pg-mini_0.1.4_amd64.deb
 ```
 
 The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop application launcher, and installs the icon in the hicolor icon theme.
@@ -179,18 +180,20 @@ To create a desktop shortcut manually, set `Exec` to the built executable and `I
 
 ## 🚀 Build Packages on GitHub
 
-The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, and a Windows setup installer. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.3`):
+The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.4`):
 
 ```bash
-git tag v0.1.3
-git push origin v0.1.3
+git tag v0.1.4
+git push origin v0.1.4
 ```
 
-Once both builds finish, GitHub publishes a Release with all three downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.
+Once all platform builds finish, GitHub publishes a Release with the Linux, Windows, and macOS downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.
 
 On Windows, the app checks whether the current session can create an OpenGL 2.0 context. It uses OpenGL when available and falls back to WGPU when it is not, such as in some Remote Desktop sessions. The app does not require PostgreSQL or a separate database client to be installed. The setup installer additionally installs Microsoft's Visual C++ runtime if it is missing, and can create Start menu and optional desktop shortcuts. The portable executable is also available for users who already have that runtime.
 
 To keep multiple PostgreSQL servers connected, choose **➕ Connect Server** and connect another saved or new profile. Use the server selector in the top bar to switch which connection the object browser and SQL editor use; switching does not disconnect the other servers. **Disconnect** disconnects only the currently selected server.
+
+On macOS, download the matching `arm64` (Apple silicon) or `x64` (Intel) `.dmg` from the GitHub Release, open it, and drag **pg-mini** into **Applications**. The app is currently unsigned and not notarized, so macOS may require you to allow it in **System Settings → Privacy & Security** the first time it is opened.
 
 ---
 
@@ -202,6 +205,7 @@ postgresql-manager/
 ├── Cargo.lock            # Locked crate versions
 ├── run.sh                # Executable launch script
 ├── packaging/             # Debian package metadata and desktop launcher
+│   └── macos/             # macOS app bundle and disk image packaging
 ├── assets/                # Application icon
 ├── .github/workflows/     # Automated release builds
 ├── README.md             # Documentation
@@ -224,7 +228,7 @@ postgresql-manager/
 
 ## 🔧 Technical Details
 
-- **GUI Framework**: [`egui`](https://github.com/emilk/egui) / [`eframe`](https://docs.rs/eframe) (v0.29), using Glow/OpenGL on Linux and WGPU on Windows.
+- **GUI Framework**: [`egui`](https://github.com/emilk/egui) / [`eframe`](https://docs.rs/eframe) (v0.29), using Glow/OpenGL on Linux and macOS, and OpenGL with WGPU fallback on Windows.
 - **PostgreSQL Client**: [`tokio-postgres`](https://docs.rs/tokio-postgres) (pure asynchronous wire-protocol implementation in Rust, without external C `libpq` dependencies).
 - **Concurrency**: Messages between the GUI and the database worker are exchanged asynchronously over standard channels, ensuring zero UI freezes during query execution.
 - **Object Catalogs**: The browser queries PostgreSQL `pg_catalog`; each expanded object group is loaded asynchronously through the existing database worker.

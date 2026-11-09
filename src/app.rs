@@ -619,7 +619,7 @@ impl eframe::App for PgMiniApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("v0.1.3").size(11.0).color(Color32::DARK_GRAY));
+                    ui.label(RichText::new("v0.1.4").size(11.0).color(Color32::DARK_GRAY));
                 });
             });
         });
@@ -1099,7 +1099,7 @@ impl eframe::App for PgMiniApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.set_min_width(340.0);
-                    ui.heading("⚡ pg-mini v0.1.3");
+                    ui.heading("⚡ pg-mini v0.1.4");
                     ui.label("Ultra-lightweight native PostgreSQL manager.");
                     ui.add_space(8.0);
                     ui.label("Built with Rust + egui/eframe + tokio-postgres.");
