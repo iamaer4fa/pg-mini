@@ -707,6 +707,7 @@ async fn fetch_schemas_impl(client: &Client) -> Result<Vec<String>, String> {
             "SELECT nspname FROM pg_catalog.pg_namespace \
              WHERE nspname NOT IN ('pg_catalog', 'information_schema') \
                AND nspname NOT LIKE 'pg_toast%' \
+               AND left(nspname, 8) <> 'pg_temp_' \
              ORDER BY nspname;",
         )
         .await

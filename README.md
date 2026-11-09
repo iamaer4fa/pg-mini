@@ -8,6 +8,8 @@
 
 **pg-mini** is an ultra-lightweight, high-performance native desktop GUI client for PostgreSQL built in **pure Rust**. 
 
+**This is pre-alpha software, do not use this in your production servers.**
+
 If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloated, or slow to start due to embedded web engines (Chromium/Electron) or Java virtual machines, **pg-mini** was created for you.
 
 ---
@@ -52,6 +54,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 ### 2. Schema & Table Explorer
 - **Hierarchical Object Browser**: Servers → Databases → Schemas, with Tables, Views, Materialized Views, Sequences, Functions, Procedures, Types, and Extensions.
 - **Lazy Catalog Loading**: Schemas and object categories load from PostgreSQL catalogs only when their tree nodes are expanded. Refresh and retry are available per node.
+- **PostgreSQL Temporary Schemas**: Names like `pg_temp_3` are server-created namespaces for temporary tables used by database sessions; they are transient, not regular application schemas.
 - **Live Search Filter**: Quickly find tables by typing in the search box.
 - **Quick Action Badges**: Distinguishes between standard base tables (`📄`) and views (`👁`).
 - **Object Context Menus (Right-Click)**: Create SQL templates, inspect properties, rename, delete with confirmation, refresh, and generate object SQL. Table, view, and materialized-view nodes also open data and schema views.
@@ -157,21 +160,18 @@ The compiled binary will be placed at `target/release/pg-mini`.
 
 ---
 
-## 🖥️ Optional: Desktop Shortcut (.desktop entry)
+## 📦 Build and Install the Ubuntu Package
 
-If you would like **pg-mini** to appear in your desktop application launcher (GNOME, KDE, etc.):
+Build a Debian package (including the desktop launcher and lightning icon):
 
-Create a file at `~/.local/share/applications/pg-mini.desktop`:
-
-```ini
-[Desktop Entry]
-Name=pg-mini
-Comment=Lightweight PostgreSQL Manager
-Exec=/home/allanregistos/apps/postgresql-manager/run.sh
-Terminal=false
-Type=Application
-Categories=Development;Database;
+```bash
+./packaging/build-deb.sh
+sudo apt install ./target/debian/pg-mini_0.1.0_amd64.deb
 ```
+
+The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop application launcher, and installs the icon in the hicolor icon theme.
+
+To create a desktop shortcut manually, set `Exec` to the built executable and `Icon` to the absolute path of `packaging/pg-mini.svg` in your local checkout.
 
 ---
 
@@ -182,6 +182,8 @@ postgresql-manager/
 ├── Cargo.toml            # Project dependencies and manifest
 ├── Cargo.lock            # Locked crate versions
 ├── run.sh                # Executable launch script
+├── packaging/             # Debian package metadata and desktop launcher
+├── assets/                # Application icon
 ├── README.md             # Documentation
 └── src/
     ├── main.rs           # Application entry point and window setup

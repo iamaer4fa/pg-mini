@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=pg-mini
+Comment=Lightweight PostgreSQL Manager
+Exec=/usr/bin/pg-mini
+Icon=pg-mini
+Terminal=false
+Type=Application
+Categories=Development;Database;
+StartupWMClass=pg-mini
