@@ -39,7 +39,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 ## 🛠️ Features
 
 ### 1. Database & Connection Management
-- **Sidebar Databases Tree**: Lists all active databases on your PostgreSQL server (e.g. `steniel_cmms`, `postgres`, `nocobase`) with real-time size indicators.
+- **Sidebar Databases Tree**: Lists all active databases on your PostgreSQL server  with real-time size indicators.
 - **1-Click Database Switching**: Click any database on the sidebar to instantly switch your active connection.
 - **Database Context Menu (Right-Click)**:
   - `⚡ Open Query Tool`: Opens SQL Editor targeting this database.
@@ -58,7 +58,6 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 ### 2. Schema & Table Explorer
 - **Hierarchical Object Browser**: Servers → Databases → Schemas, with Tables, Views, Materialized Views, Sequences, Functions, Procedures, Types, and Extensions.
 - **Lazy Catalog Loading**: Schemas and object categories load from PostgreSQL catalogs only when their tree nodes are expanded. Refresh and retry are available per node.
-- **PostgreSQL Temporary Schemas**: Names like `pg_temp_3` are server-created namespaces for temporary tables used by database sessions; they are transient, not regular application schemas.
 - **Live Search Filter**: Quickly find tables by typing in the search box.
 - **Quick Action Badges**: Distinguishes between standard base tables (`📄`) and views (`👁`).
 - **Object Context Menus (Right-Click)**: Create SQL templates, inspect properties, rename, delete with confirmation, refresh, and generate object SQL. Table, view, and materialized-view nodes also open data and schema views.
@@ -152,7 +151,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 ### 1. Quick Launch
 The project comes with a pre-configured launcher script:
 ```bash
-cd /home/allanregistos/apps/postgresql-manager
+cd ~/pg-mini
 ./run.sh
 ```
 
