@@ -6,6 +6,7 @@ use std::{
 };
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
+use crate::activity::{ActivityLock, ActivitySession, ActivitySnapshot, SizeEntry};
 use crate::models::{
     AddColumnForm, CellValue, ColumnItem, ConnectionConfig, CreateTableForm, DatabaseItem,
     DbObjectItem, DbObjectKind, DbObjectRef, EditableCell, ObjectTreeKey, QueryResult, RoleForm,
@@ -18,6 +19,7 @@ pub enum DbRequest {
     Disconnect,
     FetchDatabases,
     FetchRoles,
+    FetchActivity,
     SaveRole(RoleForm),
     DropRole(String),
     ExecuteDdl(String),
@@ -90,6 +92,20 @@ pub enum DbRequest {
     },
 }
 
+fn parse_optional_activity_f64(
+    row: &tokio_postgres::SimpleQueryRow,
+    index: usize,
+    label: &str,
+) -> Result<Option<f64>, String> {
+    row.get(index)
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .map_err(|_| format!("Activity query returned an invalid {label}"))
+        })
+        .transpose()
+}
+
 #[derive(Debug)]
 pub enum DbResponse {
     Connected {
@@ -101,6 +117,7 @@ pub enum DbResponse {
     Disconnected,
     DatabasesFetched(Result<Vec<DatabaseItem>, String>),
     RolesFetched(Result<Vec<RoleItem>, String>),
+    ActivityFetched(Result<ActivitySnapshot, String>),
     SchemasFetched {
         database: String,
         result: Result<Vec<String>, String>,
@@ -195,6 +212,14 @@ impl DbWorker {
                                     let _ = res_tx.send(DbResponse::Busy(true));
                                     let result = fetch_roles_impl(client).await;
                                     let _ = res_tx.send(DbResponse::RolesFetched(result));
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::FetchActivity => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    let result = fetch_activity_impl(client).await;
+                                    let _ = res_tx.send(DbResponse::ActivityFetched(result));
                                     let _ = res_tx.send(DbResponse::Busy(false));
                                 }
                             }
@@ -940,6 +965,150 @@ async fn fetch_roles_impl(client: &Client) -> Result<Vec<RoleItem>, String> {
     }
 
     Ok(roles)
+}
+
+async fn fetch_activity_impl(client: &Client) -> Result<ActivitySnapshot, String> {
+    let session_rows = client
+        .simple_query(
+            "SELECT pid::text, usename, datname, application_name, \
+             COALESCE(client_addr::text, 'local'), state, \
+             concat_ws(': ', wait_event_type, wait_event), \
+             CASE WHEN state = 'active' AND query_start IS NOT NULL \
+                  THEN round(extract(epoch FROM clock_timestamp() - query_start), 3)::text \
+                  ELSE NULL END, \
+             left(query, 2000) \
+             FROM pg_catalog.pg_stat_activity \
+             WHERE pid <> pg_backend_pid() \
+             ORDER BY (state = 'active') DESC, query_start ASC NULLS LAST \
+             LIMIT 100;",
+        )
+        .await
+        .map_err(|error| format!("Failed to fetch active sessions: {error}"))?;
+
+    let mut sessions = Vec::new();
+    for row in session_rows {
+        if let SimpleQueryMessage::Row(row) = row {
+            sessions.push(ActivitySession {
+                pid: parse_activity_i32(&row, 0, "session PID")?,
+                username: activity_value(&row, 1),
+                database: activity_value(&row, 2),
+                application: activity_value(&row, 3),
+                client_addr: activity_value(&row, 4),
+                state: activity_value(&row, 5),
+                wait_event: activity_value(&row, 6),
+                duration_seconds: parse_optional_activity_f64(&row, 7, "session duration")?,
+                query: activity_value(&row, 8),
+            });
+        }
+    }
+
+    let lock_rows = client
+        .simple_query(
+            "SELECT blocked.pid::text, blocked.usename, blocked.datname, \
+             extract(epoch FROM clock_timestamp() - blocked.query_start)::text, \
+             blocking.pid::text, blocking.usename, left(blocking.query, 2000), \
+             left(blocked.query, 2000) \
+             FROM pg_catalog.pg_stat_activity AS blocked \
+             CROSS JOIN LATERAL unnest(pg_catalog.pg_blocking_pids(blocked.pid)) AS blocker(pid) \
+             JOIN pg_catalog.pg_stat_activity AS blocking ON blocking.pid = blocker.pid \
+             WHERE blocked.pid <> pg_backend_pid() \
+             ORDER BY blocked.query_start ASC NULLS LAST LIMIT 100;",
+        )
+        .await
+        .map_err(|error| format!("Failed to fetch blocked sessions: {error}"))?;
+
+    let mut locks = Vec::new();
+    for row in lock_rows {
+        if let SimpleQueryMessage::Row(row) = row {
+            locks.push(ActivityLock {
+                blocked_pid: parse_activity_i32(&row, 0, "blocked PID")?,
+                blocked_user: activity_value(&row, 1),
+                database: activity_value(&row, 2),
+                wait_seconds: parse_optional_activity_f64(&row, 3, "lock wait duration")?,
+                blocking_pid: parse_activity_i32(&row, 4, "blocking PID")?,
+                blocking_user: activity_value(&row, 5),
+                blocking_query: activity_value(&row, 6),
+                blocked_query: activity_value(&row, 7),
+            });
+        }
+    }
+
+    let database_rows = client
+        .simple_query(
+            "SELECT datname, pg_size_pretty(pg_database_size(datname)), \
+             pg_database_size(datname)::text \
+             FROM pg_catalog.pg_database \
+             WHERE NOT datistemplate AND has_database_privilege(datname, 'CONNECT') \
+             ORDER BY pg_database_size(datname) DESC LIMIT 50;",
+        )
+        .await
+        .map_err(|error| format!("Failed to fetch database sizes: {error}"))?;
+    let database_sizes = parse_size_rows(database_rows, "database")?;
+
+    let table_rows = client
+        .simple_query(
+            "SELECT format('%I.%I', schemaname, relname), \
+             pg_size_pretty(pg_total_relation_size(relid)), \
+             pg_total_relation_size(relid)::text \
+             FROM pg_catalog.pg_statio_user_tables \
+             ORDER BY pg_total_relation_size(relid) DESC LIMIT 50;",
+        )
+        .await
+        .map_err(|error| format!("Failed to fetch table sizes: {error}"))?;
+    let table_sizes = parse_size_rows(table_rows, "table")?;
+
+    Ok(ActivitySnapshot {
+        sessions,
+        locks,
+        database_sizes,
+        table_sizes,
+    })
+}
+
+fn activity_value(row: &tokio_postgres::SimpleQueryRow, index: usize) -> String {
+    row.get(index)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("—")
+        .to_string()
+}
+
+fn parse_activity_i32(
+    row: &tokio_postgres::SimpleQueryRow,
+    index: usize,
+    label: &str,
+) -> Result<i32, String> {
+    row.get(index)
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| format!("Activity query returned an invalid {label}"))
+}
+
+fn parse_size_rows(
+    rows: Vec<SimpleQueryMessage>,
+    object_kind: &str,
+) -> Result<Vec<SizeEntry>, String> {
+    rows.into_iter()
+        .filter_map(|row| match row {
+            SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .map(|row| {
+            let name = row
+                .get(0)
+                .ok_or_else(|| format!("Size query returned a {object_kind} without a name"))?;
+            let size = row.get(1).ok_or_else(|| {
+                format!("Size query returned a {object_kind} without a formatted size")
+            })?;
+            let bytes = row
+                .get(2)
+                .and_then(|value| value.parse::<i64>().ok())
+                .ok_or_else(|| format!("Size query returned an invalid {object_kind} size"))?;
+            Ok(SizeEntry {
+                name: name.to_string(),
+                size: size.to_string(),
+                bytes,
+            })
+        })
+        .collect()
 }
 
 fn parse_role_row(row: &tokio_postgres::SimpleQueryRow) -> Result<RoleItem, String> {

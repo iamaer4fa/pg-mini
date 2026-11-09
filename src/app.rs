@@ -1,6 +1,7 @@
 use egui::{CentralPanel, Color32, RichText, SidePanel, TopBottomPanel};
 use std::time::{Duration, Instant};
 
+use crate::activity::ActivitySnapshot;
 use crate::config::ConfigManager;
 use crate::db::{DbRequest, DbResponse, DbWorker};
 use crate::models::{
@@ -8,6 +9,7 @@ use crate::models::{
     DbObjectKind, DbObjectRef, EditableCell, QueryResult, RoleItem, TableItem,
 };
 use crate::ui::columns_view::{ColumnsViewAction, render_columns_view};
+use crate::ui::activity_view::render_activity_view;
 use crate::ui::connection_modal::ConnectionModal;
 use crate::ui::data_table::{DataTableAction, DataTableState, export_to_csv, render_data_table};
 use crate::ui::dialogs::{
@@ -24,6 +26,7 @@ pub enum ActiveTab {
     SqlEditor,
     SchemaView,
     Roles,
+    Activity,
 }
 
 pub struct Toast {
@@ -63,6 +66,9 @@ pub struct PgMiniApp {
     current_columns: Vec<ColumnItem>,
     roles: Vec<RoleItem>,
     roles_view: RolesViewState,
+    activity_snapshot: Option<ActivitySnapshot>,
+    activity_updated_at: Option<Instant>,
+    activity_last_requested: Option<Instant>,
     sql_editor: SqlEditor,
     last_query_result: Option<Result<QueryResult, String>>,
 
@@ -123,6 +129,9 @@ impl PgMiniApp {
             current_columns: Vec::new(),
             roles: Vec::new(),
             roles_view: RolesViewState::default(),
+            activity_snapshot: None,
+            activity_updated_at: None,
+            activity_last_requested: None,
             sql_editor,
             last_query_result: None,
             add_column_modal: AddColumnModal::default(),
@@ -146,6 +155,11 @@ impl PgMiniApp {
         });
     }
 
+    fn request_activity_refresh(&mut self) {
+        self.db_worker.send(DbRequest::FetchActivity);
+        self.activity_last_requested = Some(Instant::now());
+    }
+
     fn reset_active_server_view(&mut self) {
         self.databases.clear();
         self.tables.clear();
@@ -153,6 +167,9 @@ impl PgMiniApp {
         self.current_table_data = None;
         self.current_columns.clear();
         self.roles.clear();
+        self.activity_snapshot = None;
+        self.activity_updated_at = None;
+        self.activity_last_requested = None;
         self.last_query_result = None;
         self.table_data_state = DataTableState::default();
         self.sidebar.reset_object_tree();
@@ -238,6 +255,9 @@ impl PgMiniApp {
         if self.active_tab == ActiveTab::Roles {
             self.db_worker.send(DbRequest::FetchRoles);
         }
+        if self.active_tab == ActiveTab::Activity {
+            self.request_activity_refresh();
+        }
         self.db_worker.send(DbRequest::FetchDatabases);
     }
 
@@ -258,6 +278,7 @@ impl PgMiniApp {
                     | DbResponse::TableDataResult(Err(error))
                     | DbResponse::DatabasesFetched(Err(error))
                     | DbResponse::RolesFetched(Err(error))
+                    | DbResponse::ActivityFetched(Err(error))
                     | DbResponse::SchemasFetched {
                         result: Err(error), ..
                     }
@@ -305,6 +326,9 @@ impl PgMiniApp {
                     if self.active_tab == ActiveTab::Roles {
                         self.db_worker.send(DbRequest::FetchRoles);
                     }
+                    if self.active_tab == ActiveTab::Activity {
+                        self.request_activity_refresh();
+                    }
                 }
                 DbResponse::ConnectionFailed(err) => {
                     self.is_connected = false;
@@ -330,6 +354,13 @@ impl PgMiniApp {
                 },
                 DbResponse::RolesFetched(result) => match result {
                     Ok(roles) => self.roles = roles,
+                    Err(error) => self.show_toast(error, true),
+                },
+                DbResponse::ActivityFetched(result) => match result {
+                    Ok(snapshot) => {
+                        self.activity_snapshot = Some(snapshot);
+                        self.activity_updated_at = Some(Instant::now());
+                    }
                     Err(error) => self.show_toast(error, true),
                 },
                 DbResponse::SchemasFetched { database, result } => {
@@ -470,6 +501,17 @@ impl PgMiniApp {
 impl eframe::App for PgMiniApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_db_responses(ctx);
+        if self.active_tab == ActiveTab::Activity {
+            ctx.request_repaint_after(Duration::from_secs(1));
+            if self.is_connected
+                && !self.is_busy
+                && self
+                    .activity_last_requested
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(15))
+            {
+                self.request_activity_refresh();
+            }
+        }
 
         // Top Navigation Bar
         let mut switch_to_server = None;
@@ -641,7 +683,7 @@ impl eframe::App for PgMiniApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("v0.1.7").size(11.0).color(Color32::DARK_GRAY));
+                    ui.label(RichText::new("v0.1.8").size(11.0).color(Color32::DARK_GRAY));
                 });
             });
         });
@@ -859,6 +901,15 @@ impl eframe::App for PgMiniApp {
                     self.active_tab = ActiveTab::Roles;
                     if self.is_connected {
                         self.db_worker.send(DbRequest::FetchRoles);
+                    }
+                }
+                if ui
+                    .selectable_label(self.active_tab == ActiveTab::Activity, "📈 Activity")
+                    .clicked()
+                {
+                    self.active_tab = ActiveTab::Activity;
+                    if self.is_connected {
+                        self.request_activity_refresh();
                     }
                 }
             });
@@ -1084,6 +1135,20 @@ impl eframe::App for PgMiniApp {
                         }
                     }
                 }
+                ActiveTab::Activity => {
+                    if !self.is_connected {
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Connect to a PostgreSQL server to view activity.");
+                        });
+                    } else if render_activity_view(
+                        ui,
+                        self.activity_snapshot.as_ref(),
+                        self.is_busy,
+                        self.activity_updated_at,
+                    ) {
+                        self.request_activity_refresh();
+                    }
+                }
             }
         });
 
@@ -1210,7 +1275,7 @@ impl eframe::App for PgMiniApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.set_min_width(340.0);
-                    ui.heading("⚡ pg-mini v0.1.7");
+                    ui.heading("⚡ pg-mini v0.1.8");
                     ui.label("Ultra-lightweight native PostgreSQL manager.");
                     ui.add_space(8.0);
                     ui.label("Built with Rust + egui/eframe + tokio-postgres.");

@@ -1,4 +1,5 @@
 pub mod app;
+pub mod activity;
 pub mod config;
 pub mod db;
 pub mod models;
