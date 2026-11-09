@@ -28,9 +28,20 @@ pub struct Toast {
     pub is_error: bool,
 }
 
+struct ConnectedServer {
+    config: crate::models::ConnectionConfig,
+    worker: DbWorker,
+    current_db: String,
+    host_port: String,
+    is_busy: bool,
+}
+
 pub struct PgMiniApp {
     config: AppConfig,
     db_worker: DbWorker,
+    connected_servers: Vec<ConnectedServer>,
+    active_connection: Option<crate::models::ConnectionConfig>,
+    pending_connection: Option<crate::models::ConnectionConfig>,
 
     // Connection state
     is_connected: bool,
@@ -89,6 +100,9 @@ impl PgMiniApp {
         Self {
             config,
             db_worker: DbWorker::new(),
+            connected_servers: Vec::new(),
+            active_connection: None,
+            pending_connection: None,
             is_connected: false,
             is_busy: false,
             current_db: String::new(),
@@ -122,7 +136,139 @@ impl PgMiniApp {
         });
     }
 
+    fn reset_active_server_view(&mut self) {
+        self.databases.clear();
+        self.tables.clear();
+        self.selected_table = None;
+        self.current_table_data = None;
+        self.current_columns.clear();
+        self.last_query_result = None;
+        self.table_data_state = DataTableState::default();
+        self.sidebar.reset_object_tree();
+    }
+
+    fn connect_to_server(&mut self, config: crate::models::ConnectionConfig) {
+        if self
+            .active_connection
+            .as_ref()
+            .is_some_and(|active| active.id == config.id)
+            && self.is_connected
+        {
+            self.connection_modal.is_open = false;
+            self.show_toast("This server is already connected", false);
+            return;
+        }
+
+        if self
+            .connected_servers
+            .iter()
+            .any(|server| server.config.id == config.id)
+        {
+            self.switch_active_server(&config.id);
+            return;
+        }
+
+        if self.is_connected {
+            if let Some(active_config) = self.active_connection.take() {
+                let old_worker = std::mem::replace(&mut self.db_worker, DbWorker::new());
+                self.connected_servers.push(ConnectedServer {
+                    config: active_config,
+                    worker: old_worker,
+                    current_db: self.current_db.clone(),
+                    host_port: self.host_port.clone(),
+                    is_busy: self.is_busy,
+                });
+            }
+        }
+
+        self.is_connected = false;
+        self.is_busy = false;
+        self.active_connection = None;
+        self.pending_connection = Some(config.clone());
+        self.current_db.clear();
+        self.host_port.clear();
+        self.reset_active_server_view();
+        self.connection_modal.current_cfg = config.clone();
+        self.connection_modal.error_message = None;
+        self.db_worker.send(DbRequest::Connect(config));
+    }
+
+    fn switch_active_server(&mut self, connection_id: &str) {
+        let Some(server_index) = self
+            .connected_servers
+            .iter()
+            .position(|server| server.config.id == connection_id)
+        else {
+            return;
+        };
+
+        let server = self.connected_servers.remove(server_index);
+        let old_worker = std::mem::replace(&mut self.db_worker, server.worker);
+        if self.is_connected {
+            if let Some(active_config) = self.active_connection.take() {
+                self.connected_servers.push(ConnectedServer {
+                    config: active_config,
+                    worker: old_worker,
+                    current_db: self.current_db.clone(),
+                    host_port: self.host_port.clone(),
+                    is_busy: self.is_busy,
+                });
+            }
+        }
+
+        self.active_connection = Some(server.config);
+        self.current_db = server.current_db;
+        self.host_port = server.host_port;
+        self.is_connected = true;
+        self.is_busy = server.is_busy;
+        self.pending_connection = None;
+        self.connection_modal.is_open = false;
+        self.reset_active_server_view();
+        self.db_worker.send(DbRequest::FetchDatabases);
+    }
+
+    fn poll_inactive_server_responses(&mut self) {
+        let mut errors = Vec::new();
+        let mut disconnected_server_ids = Vec::new();
+        for server in &mut self.connected_servers {
+            while let Some(response) = server.worker.try_recv() {
+                match response {
+                    DbResponse::Busy(is_busy) => server.is_busy = is_busy,
+                    DbResponse::Disconnected => {
+                        disconnected_server_ids.push(server.config.id.clone());
+                    }
+                    DbResponse::ConnectionFailed(error) | DbResponse::OperationFailed(error) => {
+                        errors.push(format!("{}: {}", server.config.name, error));
+                    }
+                    DbResponse::QueryResult(Err(error))
+                    | DbResponse::TableDataResult(Err(error))
+                    | DbResponse::DatabasesFetched(Err(error))
+                    | DbResponse::SchemasFetched {
+                        result: Err(error), ..
+                    }
+                    | DbResponse::ObjectsFetched {
+                        result: Err(error), ..
+                    }
+                    | DbResponse::ColumnsFetched(Err(error)) => {
+                        errors.push(format!("{}: {}", server.config.name, error));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if !disconnected_server_ids.is_empty() {
+            self.connected_servers
+                .retain(|server| !disconnected_server_ids.contains(&server.config.id));
+        }
+
+        for error in errors {
+            self.show_toast(error, true);
+        }
+    }
+
     fn poll_db_responses(&mut self, ctx: &egui::Context) {
+        self.poll_inactive_server_responses();
         while let Some(resp) = self.db_worker.try_recv() {
             match resp {
                 DbResponse::Connected {
@@ -131,6 +277,7 @@ impl PgMiniApp {
                     host_port,
                 } => {
                     self.is_connected = true;
+                    self.active_connection = self.pending_connection.take();
                     self.current_db = current_db.clone();
                     self.host_port = host_port.clone();
                     self.connection_modal.is_open = false;
@@ -143,19 +290,17 @@ impl PgMiniApp {
                 }
                 DbResponse::ConnectionFailed(err) => {
                     self.is_connected = false;
+                    self.active_connection = None;
+                    self.pending_connection = None;
                     self.connection_modal.error_message = Some(err.clone());
                     self.show_toast(format!("Connection error: {}", err), true);
                 }
                 DbResponse::Disconnected => {
                     self.is_connected = false;
-                    self.databases.clear();
-                    self.tables.clear();
-                    self.selected_table = None;
-                    self.current_table_data = None;
-                    self.current_columns.clear();
-                    self.last_query_result = None;
-                    self.sidebar.reset_object_tree();
-                    self.show_toast("Disconnected from PostgreSQL", false);
+                    self.active_connection = None;
+                    self.is_busy = false;
+                    self.reset_active_server_view();
+                    self.show_toast("Disconnected from active PostgreSQL server", false);
                 }
                 DbResponse::DatabasesFetched(res) => match res {
                     Ok(dbs) => {
@@ -210,6 +355,9 @@ impl PgMiniApp {
                     server_version: _,
                 } => {
                     self.current_db = db_name.clone();
+                    if let Some(connection) = &mut self.active_connection {
+                        connection.database = db_name.clone();
+                    }
                     self.selected_table = None;
                     self.current_table_data = None;
                     self.current_columns.clear();
@@ -302,6 +450,33 @@ impl eframe::App for PgMiniApp {
         self.poll_db_responses(ctx);
 
         // Top Navigation Bar
+        let mut switch_to_server = None;
+        let active_server_id = self
+            .active_connection
+            .as_ref()
+            .map(|config| config.id.clone());
+        let mut server_options: Vec<(String, String)> = self
+            .connected_servers
+            .iter()
+            .map(|server| {
+                (
+                    server.config.id.clone(),
+                    format!(
+                        "{} — {}/{}",
+                        server.config.name, server.host_port, server.current_db
+                    ),
+                )
+            })
+            .collect();
+        if self.is_connected {
+            if let Some(config) = &self.active_connection {
+                server_options.push((
+                    config.id.clone(),
+                    format!("{} — {}/{}", config.name, self.host_port, self.current_db),
+                ));
+            }
+        }
+
         TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.add_space(3.0);
             ui.horizontal(|ui| {
@@ -319,32 +494,72 @@ impl eframe::App for PgMiniApp {
 
                 ui.separator();
 
-                // Connection badge
+                if !self.connected_servers.is_empty() {
+                    let active_label = active_server_id
+                        .as_ref()
+                        .and_then(|id| server_options.iter().find(|(server_id, _)| server_id == id))
+                        .map(|(_, label)| label.as_str())
+                        .unwrap_or("Select server");
+                    egui::ComboBox::from_id_salt("active_postgres_server")
+                        .selected_text(active_label)
+                        .width(230.0)
+                        .show_ui(ui, |ui| {
+                            for (server_id, label) in &server_options {
+                                if ui
+                                    .add_enabled(
+                                        !self.is_busy,
+                                        egui::SelectableLabel::new(
+                                            active_server_id.as_ref() == Some(server_id),
+                                            label,
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    if active_server_id.as_ref() != Some(server_id) {
+                                        switch_to_server = Some(server_id.clone());
+                                    }
+                                }
+                            }
+                        });
+                }
+
                 if self.is_connected {
                     ui.label(RichText::new("●").color(Color32::from_rgb(50, 220, 80)));
                     ui.label(
                         RichText::new(format!("{}/{}", self.host_port, self.current_db)).strong(),
                     );
-                    if ui.button("🔌 Disconnect").clicked() {
+                    if ui
+                        .add_enabled(!self.is_busy, egui::Button::new("🔌 Disconnect"))
+                        .clicked()
+                    {
                         self.db_worker.send(DbRequest::Disconnect);
                     }
                 } else {
                     ui.label(RichText::new("●").color(Color32::from_rgb(220, 50, 50)));
-                    ui.label(RichText::new("Disconnected").color(Color32::GRAY));
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("🔌 Connect...")
-                                    .strong()
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(Color32::from_rgb(16, 145, 90))
-                            .rounding(egui::Rounding::same(6.0)),
+                    ui.label(
+                        RichText::new(if self.connected_servers.is_empty() {
+                            "Disconnected".to_string()
+                        } else {
+                            format!("{} other server(s) connected", self.connected_servers.len())
+                        })
+                        .color(Color32::GRAY),
+                    );
+                }
+
+                if ui
+                    .add_enabled(
+                        !self.is_busy,
+                        egui::Button::new(
+                            RichText::new("➕ Connect Server")
+                                .strong()
+                                .color(Color32::WHITE),
                         )
-                        .clicked()
-                    {
-                        self.connection_modal.is_open = true;
-                    }
+                        .fill(Color32::from_rgb(16, 145, 90))
+                        .rounding(egui::Rounding::same(6.0)),
+                    )
+                    .clicked()
+                {
+                    self.connection_modal.is_open = true;
                 }
 
                 if self.is_busy {
@@ -371,6 +586,9 @@ impl eframe::App for PgMiniApp {
             });
             ui.add_space(3.0);
         });
+        if let Some(server_id) = switch_to_server {
+            self.switch_active_server(&server_id);
+        }
 
         // Bottom Status Bar
         TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
@@ -401,7 +619,7 @@ impl eframe::App for PgMiniApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("v0.1.0").size(11.0).color(Color32::DARK_GRAY));
+                    ui.label(RichText::new("v0.1.3").size(11.0).color(Color32::DARK_GRAY));
                 });
             });
         });
@@ -773,11 +991,13 @@ impl eframe::App for PgMiniApp {
         });
 
         // Modals
-        if let Some(cfg) =
-            self.connection_modal
-                .show(ctx, &mut self.config, self.is_connected, self.is_busy)
-        {
-            self.db_worker.send(DbRequest::Connect(cfg));
+        if let Some(cfg) = self.connection_modal.show(
+            ctx,
+            &mut self.config,
+            self.is_connected || !self.connected_servers.is_empty(),
+            self.is_busy,
+        ) {
+            self.connect_to_server(cfg);
         }
 
         if let Some(form) = self.add_column_modal.show(ctx, self.is_busy) {
@@ -879,7 +1099,7 @@ impl eframe::App for PgMiniApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.set_min_width(340.0);
-                    ui.heading("⚡ pg-mini v0.1.0");
+                    ui.heading("⚡ pg-mini v0.1.3");
                     ui.label("Ultra-lightweight native PostgreSQL manager.");
                     ui.add_space(8.0);
                     ui.label("Built with Rust + egui/eframe + tokio-postgres.");

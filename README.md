@@ -46,6 +46,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
   - `➕ Create Table...`: Launches a quick table creation modal.
   - `🔄 Refresh Tables`: Reloads schema objects.
   - `🗑️ Drop Database...`: Drops the database with confirmation (protected against dropping active DB).
+- **Multiple Live Servers**: Connect to several PostgreSQL servers at once, switch the active server from the top bar, and keep each server connected while working with another.
 - **Profile Management**: Save and switch between multiple PostgreSQL connection profiles (Host, Port, Database, Username, Password).
 - **Persistent Storage**: Saved connections and settings are automatically stored in `~/.config/pg-mini/config.json`.
 - **Show/Hide Password**: Quick toggle to verify database passwords.
@@ -135,6 +136,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 
 ### Prerequisites
 - Linux OS (Ubuntu, Debian, Fedora, Arch, etc.)
+- Windows (Windows 10, Windows 11 with OpenGL 2)
 - Wayland or X11 desktop session
 - Rust & Cargo (only if building from source)
 
@@ -166,7 +168,7 @@ Build a Debian package (including the desktop launcher and lightning icon):
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./target/debian/pg-mini_0.1.2_amd64.deb
+sudo apt install ./target/debian/pg-mini_0.1.3_amd64.deb
 ```
 
 The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop application launcher, and installs the icon in the hicolor icon theme.
@@ -177,16 +179,18 @@ To create a desktop shortcut manually, set `Exec` to the built executable and `I
 
 ## 🚀 Build Packages on GitHub
 
-The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, and a Windows setup installer. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.2`):
+The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, and a Windows setup installer. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.3`):
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 Once both builds finish, GitHub publishes a Release with all three downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.
 
 On Windows, the app checks whether the current session can create an OpenGL 2.0 context. It uses OpenGL when available and falls back to WGPU when it is not, such as in some Remote Desktop sessions. The app does not require PostgreSQL or a separate database client to be installed. The setup installer additionally installs Microsoft's Visual C++ runtime if it is missing, and can create Start menu and optional desktop shortcuts. The portable executable is also available for users who already have that runtime.
+
+To keep multiple PostgreSQL servers connected, choose **➕ Connect Server** and connect another saved or new profile. Use the server selector in the top bar to switch which connection the object browser and SQL editor use; switching does not disconnect the other servers. **Disconnect** disconnects only the currently selected server.
 
 ---
 
