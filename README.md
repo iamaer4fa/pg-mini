@@ -166,7 +166,7 @@ Build a Debian package (including the desktop launcher and lightning icon):
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./target/debian/pg-mini_0.1.0_amd64.deb
+sudo apt install ./target/debian/pg-mini_0.1.2_amd64.deb
 ```
 
 The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop application launcher, and installs the icon in the hicolor icon theme.
@@ -177,16 +177,16 @@ To create a desktop shortcut manually, set `Exec` to the built executable and `I
 
 ## 🚀 Build Packages on GitHub
 
-The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, and a Windows setup installer. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.0`):
+The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, and a Windows setup installer. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.2`):
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 Once both builds finish, GitHub publishes a Release with all three downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.
 
-The Windows app is a native executable and does not require PostgreSQL or a separate database client to be installed. The setup installer additionally installs Microsoft's Visual C++ runtime if it is missing, and can create Start menu and optional desktop shortcuts. The portable executable is also available for users who already have that runtime.
+On Windows, the app checks whether the current session can create an OpenGL 2.0 context. It uses OpenGL when available and falls back to WGPU when it is not, such as in some Remote Desktop sessions. The app does not require PostgreSQL or a separate database client to be installed. The setup installer additionally installs Microsoft's Visual C++ runtime if it is missing, and can create Start menu and optional desktop shortcuts. The portable executable is also available for users who already have that runtime.
 
 ---
 
@@ -220,7 +220,7 @@ postgresql-manager/
 
 ## 🔧 Technical Details
 
-- **GUI Framework**: [`egui`](https://github.com/emilk/egui) / [`eframe`](https://docs.rs/eframe) (v0.29) with hardware-accelerated OpenGL / Glow rendering.
+- **GUI Framework**: [`egui`](https://github.com/emilk/egui) / [`eframe`](https://docs.rs/eframe) (v0.29), using Glow/OpenGL on Linux and WGPU on Windows.
 - **PostgreSQL Client**: [`tokio-postgres`](https://docs.rs/tokio-postgres) (pure asynchronous wire-protocol implementation in Rust, without external C `libpq` dependencies).
 - **Concurrency**: Messages between the GUI and the database worker are exchanged asynchronously over standard channels, ensuring zero UI freezes during query execution.
 - **Object Catalogs**: The browser queries PostgreSQL `pg_catalog`; each expanded object group is loaded asynchronously through the existing database worker.
