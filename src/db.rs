@@ -20,6 +20,7 @@ pub enum DbRequest {
     FetchRoles,
     SaveRole(RoleForm),
     DropRole(String),
+    ExecuteDdl(String),
     SwitchDatabase(String),
     FetchSchemas {
         database: String,
@@ -247,6 +248,27 @@ impl DbWorker {
                                         Err(error) => {
                                             let _ = res_tx.send(DbResponse::OperationFailed(
                                                 format!("Failed to drop role: {error}"),
+                                            ));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::ExecuteDdl(sql) => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    match client.simple_query(&sql).await {
+                                        Ok(_) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: "Database object operation completed"
+                                                    .to_string(),
+                                                refresh_tables: true,
+                                                refresh_columns: false,
+                                            });
+                                        }
+                                        Err(error) => {
+                                            let _ = res_tx.send(DbResponse::OperationFailed(
+                                                format!("Failed to execute generated SQL: {error}"),
                                             ));
                                         }
                                     }
@@ -949,13 +971,21 @@ fn parse_role_row(row: &tokio_postgres::SimpleQueryRow) -> Result<RoleItem, Stri
     })
 }
 
-fn role_sql(form: &RoleForm) -> Result<Vec<String>, String> {
+pub fn role_sql_preview(form: &RoleForm) -> Result<String, String> {
     let name = form.name.trim();
     if name.is_empty() || name.contains('\0') {
         return Err("Role name must not be empty or contain a NUL character".to_string());
     }
     if form.password.contains('\0') {
         return Err("Password must not contain a NUL character".to_string());
+    }
+    if form
+        .memberships
+        .iter()
+        .chain(form.original_memberships.iter())
+        .any(|membership| membership.is_empty() || membership.contains('\0'))
+    {
+        return Err("Role memberships must have valid role names".to_string());
     }
     let connection_limit = form
         .connection_limit
@@ -1048,7 +1078,7 @@ fn role_sql(form: &RoleForm) -> Result<Vec<String>, String> {
             ));
         }
     }
-    Ok(statements)
+    Ok(statements.join("\n"))
 }
 
 fn role_sql_literal(value: &str) -> String {
@@ -1060,7 +1090,7 @@ fn quote_role_ident(value: &str) -> String {
 }
 
 async fn save_role_impl(client: &Client, form: &RoleForm) -> Result<(), String> {
-    let sql = role_sql(form)?.join("\n");
+    let sql = role_sql_preview(form)?;
     client
         .simple_query(&sql)
         .await
@@ -1070,7 +1100,7 @@ async fn save_role_impl(client: &Client, form: &RoleForm) -> Result<(), String> 
 
 #[cfg(test)]
 mod db_tests {
-    use super::{is_plain_sql_backup, role_sql};
+    use super::{is_plain_sql_backup, role_sql_preview};
     use crate::models::RoleForm;
     use std::path::Path;
 
@@ -1087,7 +1117,7 @@ mod db_tests {
         let mut form = RoleForm::new();
         form.name = "user\" name".to_string();
         form.password = "p\\ass'word".to_string();
-        let sql = role_sql(&form).unwrap().join("\n");
+        let sql = role_sql_preview(&form).unwrap();
         assert!(sql.starts_with("CREATE ROLE \"user\"\" name\" WITH LOGIN"));
         assert!(sql.contains("PASSWORD E'p\\\\ass''word'"));
         assert!(!sql.contains("p\\ass'word';"));
@@ -1097,7 +1127,7 @@ mod db_tests {
     fn role_sql_validates_connection_limit() {
         let mut form = RoleForm::new();
         form.connection_limit = "-2".to_string();
-        assert!(role_sql(&form).is_err());
+        assert!(role_sql_preview(&form).is_err());
     }
 
     #[test]
@@ -1105,10 +1135,10 @@ mod db_tests {
         let mut form = RoleForm::new();
         form.original_name = Some("old_role".to_string());
         form.name = "new_role".to_string();
-        let statements = role_sql(&form).unwrap();
-        assert!(statements[0].contains("RENAME TO \"new_role\""));
-        assert!(statements[1].starts_with("ALTER ROLE \"new_role\" WITH"));
-        assert!(!statements[1].contains("PASSWORD"));
+        let sql = role_sql_preview(&form).unwrap();
+        assert!(sql.contains("RENAME TO \"new_role\""));
+        assert!(sql.contains("ALTER ROLE \"new_role\" WITH"));
+        assert!(!sql.contains("PASSWORD"));
     }
 
     #[test]
@@ -1118,13 +1148,9 @@ mod db_tests {
         form.name = "app_user".to_string();
         form.original_memberships = vec!["old_group".to_string()];
         form.memberships = vec!["new_group".to_string()];
-        let statements = role_sql(&form).unwrap();
-        assert!(statements.iter().any(|sql| {
-            sql == "GRANT \"new_group\" TO \"app_user\";"
-        }));
-        assert!(statements.iter().any(|sql| {
-            sql == "REVOKE \"old_group\" FROM \"app_user\";"
-        }));
+        let sql = role_sql_preview(&form).unwrap();
+        assert!(sql.contains("GRANT \"new_group\" TO \"app_user\";"));
+        assert!(sql.contains("REVOKE \"old_group\" FROM \"app_user\";"));
     }
 }
 

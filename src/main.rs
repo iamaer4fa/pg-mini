@@ -2,6 +2,7 @@ pub mod app;
 pub mod config;
 pub mod db;
 pub mod models;
+pub mod sql_ddl;
 pub mod ui;
 
 use app::PgMiniApp;

@@ -201,36 +201,30 @@ impl RolesViewState {
                 });
                 ui.add_space(6.0);
 
-                egui::CollapsingHeader::new(format!(
-                    "Membership ({})",
-                    form.memberships.len()
-                ))
-                .default_open(true)
-                .show(ui, |ui| {
-                    ui.label("Roles this role is a member of:");
-                    egui::ScrollArea::vertical()
-                        .max_height(120.0)
-                        .show(ui, |ui| {
-                            for available_role in roles.iter().filter(|role| {
-                                form.original_name.as_deref() != Some(role.name.as_str())
-                                    && form.name.trim() != role.name
-                            }) {
-                                let mut selected =
-                                    form.memberships.contains(&available_role.name);
-                                if ui
-                                    .checkbox(&mut selected, &available_role.name)
-                                    .changed()
-                                {
-                                    if selected {
-                                        form.memberships.push(available_role.name.clone());
-                                    } else {
-                                        form.memberships
-                                            .retain(|name| name != &available_role.name);
+                egui::CollapsingHeader::new(format!("Membership ({})", form.memberships.len()))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.label("Roles this role is a member of:");
+                        egui::ScrollArea::vertical()
+                            .max_height(120.0)
+                            .show(ui, |ui| {
+                                for available_role in roles.iter().filter(|role| {
+                                    form.original_name.as_deref() != Some(role.name.as_str())
+                                        && form.name.trim() != role.name
+                                }) {
+                                    let mut selected =
+                                        form.memberships.contains(&available_role.name);
+                                    if ui.checkbox(&mut selected, &available_role.name).changed() {
+                                        if selected {
+                                            form.memberships.push(available_role.name.clone());
+                                        } else {
+                                            form.memberships
+                                                .retain(|name| name != &available_role.name);
+                                        }
                                     }
                                 }
-                            }
-                        });
-                });
+                            });
+                    });
                 ui.add_space(6.0);
 
                 egui::Grid::new("role_options_grid")
@@ -256,6 +250,34 @@ impl RolesViewState {
                         .size(11.0)
                         .color(Color32::GRAY),
                 );
+
+                let mut preview_form = form.clone();
+                if !preview_form.password.is_empty() {
+                    preview_form.password = "<hidden>".to_string();
+                }
+                let preview = crate::db::role_sql_preview(&preview_form);
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Generated SQL preview (password hidden)")
+                        .size(11.0)
+                        .color(Color32::GRAY),
+                );
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(25, 28, 35))
+                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(50, 55, 65)))
+                    .rounding(4.0)
+                    .inner_margin(6.0)
+                    .show(ui, |ui| {
+                        let mut preview_text =
+                            preview.unwrap_or_else(|error| format!("Cannot generate SQL: {error}"));
+                        ui.add(
+                            egui::TextEdit::multiline(&mut preview_text)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_rows(5)
+                                .desired_width(f32::INFINITY)
+                                .interactive(false),
+                        );
+                    });
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {

@@ -1,6 +1,7 @@
 use crate::models::{
     DatabaseItem, DbObjectItem, DbObjectKind, DbObjectRef, ObjectTreeKey, TableItem,
 };
+use crate::sql_ddl::{DdlForm, DdlFormKind};
 use egui::{Color32, RichText, ScrollArea, Ui};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -44,6 +45,7 @@ pub enum SidebarAction {
     OpenCreateTable {
         schema: String,
     },
+    OpenDdlForm(DdlForm),
     ConfirmDropTable {
         schema: String,
         table: String,
@@ -658,6 +660,34 @@ impl Sidebar {
                                 }
                                 ui.close_menu();
                             }
+                            if key.kind == DbObjectKind::Table {
+                                ui.menu_button("Create", |ui| {
+                                    for (label, kind) in [
+                                        ("Index...", DdlFormKind::Index),
+                                        ("Foreign Key...", DdlFormKind::ForeignKey),
+                                        ("Constraint...", DdlFormKind::Constraint),
+                                    ] {
+                                        if ui.button(label).clicked() {
+                                            if let Some(schema) = key.schema.as_deref() {
+                                                *action = Some(SidebarAction::OpenDdlForm(
+                                                    DdlForm::new(kind, schema, &item.name),
+                                                ));
+                                            }
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                                if ui.button("Manage Grants...").clicked() {
+                                    if let Some(schema) = key.schema.as_deref() {
+                                        *action = Some(SidebarAction::OpenDdlForm(DdlForm::new(
+                                            DdlFormKind::Grant,
+                                            schema,
+                                            &item.name,
+                                        )));
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
                             if ui.button("View Schema").clicked() {
                                 if let Some(schema) = key.schema.clone() {
                                     *action = Some(SidebarAction::ViewColumns {
@@ -733,6 +763,24 @@ impl Sidebar {
                         *action = Some(SidebarAction::OpenCreateTable {
                             schema: key.schema.clone().unwrap_or_else(|| "public".to_string()),
                         });
+                        ui.close_menu();
+                    }
+                } else if key.kind == DbObjectKind::View {
+                    if ui.button("View...").clicked() {
+                        *action = Some(SidebarAction::OpenDdlForm(DdlForm::new(
+                            DdlFormKind::View,
+                            key.schema.as_deref().unwrap_or("public"),
+                            "",
+                        )));
+                        ui.close_menu();
+                    }
+                } else if key.kind == DbObjectKind::Sequence {
+                    if ui.button("Sequence...").clicked() {
+                        *action = Some(SidebarAction::OpenDdlForm(DdlForm::new(
+                            DdlFormKind::Sequence,
+                            key.schema.as_deref().unwrap_or("public"),
+                            "",
+                        )));
                         ui.close_menu();
                     }
                 } else {
@@ -1090,6 +1138,37 @@ impl Sidebar {
                                                 table: item.name.clone(),
                                             });
                                             ui.close_menu();
+                                        }
+
+                                        if item.table_type == "BASE TABLE" {
+                                            ui.menu_button("Create", |ui| {
+                                                for (label, kind) in [
+                                                    ("Index...", DdlFormKind::Index),
+                                                    ("Foreign Key...", DdlFormKind::ForeignKey),
+                                                    ("Constraint...", DdlFormKind::Constraint),
+                                                ] {
+                                                    if ui.button(label).clicked() {
+                                                        action = Some(SidebarAction::OpenDdlForm(
+                                                            DdlForm::new(
+                                                                kind,
+                                                                &item.schema,
+                                                                &item.name,
+                                                            ),
+                                                        ));
+                                                        ui.close_menu();
+                                                    }
+                                                }
+                                            });
+                                            if ui.button("Manage Grants...").clicked() {
+                                                action = Some(SidebarAction::OpenDdlForm(
+                                                    DdlForm::new(
+                                                        DdlFormKind::Grant,
+                                                        &item.schema,
+                                                        &item.name,
+                                                    ),
+                                                ));
+                                                ui.close_menu();
+                                            }
                                         }
 
                                         if ui.button("📋 View Table Schema").clicked() {

@@ -103,6 +103,8 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 - **Quick Snippets**: Dropdown with ready-to-use SQL templates (Server Info, Database Sizes, Table Counts, etc.).
 - **pgAdmin-Style Admin Insights**: One-click query plans (`EXPLAIN`, without executing the query), active sessions, blocked sessions, database statistics, and database roles in the normal result grid.
 - **Users & Roles Management**: Create, edit, filter, and drop PostgreSQL login roles (users) and non-login group roles; configure passwords, role attributes, group-role membership, connection limits, and validity timestamps. PostgreSQL still enforces the connected account's role-administration privileges.
+- **Schema DDL Forms**: Create indexes, foreign keys, CHECK/UNIQUE/PRIMARY KEY constraints, views, and sequences from object-browser context menus; inspect generated SQL previews before execution.
+- **Table Grants**: Grant or revoke table privileges for existing roles or `PUBLIC`, including grant option and revoke cascade controls, with a generated SQL preview.
 - **Persistent Query History**: Keeps the latest 200 distinct queries in the app configuration, with search, load-into-editor, and copy actions.
 - **Error Reporting**: Clear, highlighted PostgreSQL error banners when syntax or constraints fail.
 
@@ -172,7 +174,7 @@ Build a Debian package (including the desktop launcher and lightning icon):
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./target/debian/pg-mini_0.1.6_amd64.deb
+sudo apt install ./target/debian/pg-mini_0.1.7_amd64.deb
 ```
 
 The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop application launcher, and installs the icon in the hicolor icon theme.
@@ -183,11 +185,11 @@ To create a desktop shortcut manually, set `Exec` to the built executable and `I
 
 ## 🚀 Build Packages on GitHub
 
-The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.6`):
+The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.7`):
 
 ```bash
-git tag v0.1.6
-git push origin v0.1.6
+git tag v0.1.7
+git push origin v0.1.7
 ```
 
 Once all platform builds finish, GitHub publishes a Release with the Linux, Windows, and macOS downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.

@@ -10,7 +10,9 @@ use crate::models::{
 use crate::ui::columns_view::{ColumnsViewAction, render_columns_view};
 use crate::ui::connection_modal::ConnectionModal;
 use crate::ui::data_table::{DataTableAction, DataTableState, export_to_csv, render_data_table};
-use crate::ui::dialogs::{AddColumnModal, CreateTableModal, render_confirm_dialog};
+use crate::ui::dialogs::{
+    AddColumnModal, CreateTableModal, ObjectDdlModal, render_confirm_dialog,
+};
 use crate::ui::roles::{RolesAction, RolesViewState};
 use crate::ui::sidebar::{Sidebar, SidebarAction};
 use crate::ui::sql_editor::{SqlEditor, SqlEditorAction};
@@ -67,6 +69,7 @@ pub struct PgMiniApp {
     // Modals
     add_column_modal: AddColumnModal,
     create_table_modal: CreateTableModal,
+    object_ddl_modal: ObjectDdlModal,
     confirm_dialog: ConfirmDialogState,
     rename_object: Option<DbObjectRef>,
     rename_object_name: String,
@@ -124,6 +127,7 @@ impl PgMiniApp {
             last_query_result: None,
             add_column_modal: AddColumnModal::default(),
             create_table_modal: CreateTableModal::default(),
+            object_ddl_modal: ObjectDdlModal::default(),
             confirm_dialog: ConfirmDialogState::default(),
             rename_object: None,
             rename_object_name: String::new(),
@@ -637,7 +641,7 @@ impl eframe::App for PgMiniApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("v0.1.6").size(11.0).color(Color32::DARK_GRAY));
+                    ui.label(RichText::new("v0.1.7").size(11.0).color(Color32::DARK_GRAY));
                 });
             });
         });
@@ -711,6 +715,12 @@ impl eframe::App for PgMiniApp {
                         }
                         SidebarAction::OpenCreateTable { schema } => {
                             self.create_table_modal.open_for(&schema);
+                        }
+                        SidebarAction::OpenDdlForm(form) => {
+                            if form.kind == crate::sql_ddl::DdlFormKind::Grant {
+                                self.db_worker.send(DbRequest::FetchRoles);
+                            }
+                            self.object_ddl_modal.open(form);
                         }
                         SidebarAction::ConfirmDropTable { schema, table } => {
                             self.confirm_dialog = ConfirmDialogState {
@@ -1095,6 +1105,13 @@ impl eframe::App for PgMiniApp {
             self.db_worker.send(DbRequest::CreateTable(form));
         }
 
+        if let Some(sql) = self
+            .object_ddl_modal
+            .show(ctx, self.is_busy, &self.roles)
+        {
+            self.db_worker.send(DbRequest::ExecuteDdl(sql));
+        }
+
         if let Some(action) = render_confirm_dialog(ctx, &mut self.confirm_dialog, self.is_busy) {
             match action {
                 ConfirmAction::DropTable { schema, table } => {
@@ -1193,7 +1210,7 @@ impl eframe::App for PgMiniApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.set_min_width(340.0);
-                    ui.heading("⚡ pg-mini v0.1.6");
+                    ui.heading("⚡ pg-mini v0.1.7");
                     ui.label("Ultra-lightweight native PostgreSQL manager.");
                     ui.add_space(8.0);
                     ui.label("Built with Rust + egui/eframe + tokio-postgres.");
