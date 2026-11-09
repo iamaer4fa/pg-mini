@@ -175,6 +175,21 @@ To create a desktop shortcut manually, set `Exec` to the built executable and `I
 
 ---
 
+## 🚀 Build Packages on GitHub
+
+The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, and a Windows setup installer. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.0`):
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Once both builds finish, GitHub publishes a Release with all three downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.
+
+The Windows app is a native executable and does not require PostgreSQL or a separate database client to be installed. The setup installer additionally installs Microsoft's Visual C++ runtime if it is missing, and can create Start menu and optional desktop shortcuts. The portable executable is also available for users who already have that runtime.
+
+---
+
 ## 📁 Project Structure
 
 ```text
@@ -184,6 +199,7 @@ postgresql-manager/
 ├── run.sh                # Executable launch script
 ├── packaging/             # Debian package metadata and desktop launcher
 ├── assets/                # Application icon
+├── .github/workflows/     # Automated release builds
 ├── README.md             # Documentation
 └── src/
     ├── main.rs           # Application entry point and window setup
