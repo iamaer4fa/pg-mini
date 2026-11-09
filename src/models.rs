@@ -495,6 +495,10 @@ pub enum ConfirmAction {
     DropDatabase {
         db_name: String,
     },
+    RestoreDatabase {
+        db_name: String,
+        file_path: std::path::PathBuf,
+    },
     DropObject {
         object: DbObjectRef,
     },

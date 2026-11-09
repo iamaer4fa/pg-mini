@@ -1,5 +1,9 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
+use std::{
+    path::Path,
+    process::{Command, Stdio},
+};
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 use crate::models::{
@@ -49,6 +53,14 @@ pub enum DbRequest {
     },
     DropDatabase {
         db_name: String,
+    },
+    BackupDatabase {
+        db_name: String,
+        file_path: std::path::PathBuf,
+    },
+    RestoreDatabase {
+        db_name: String,
+        file_path: std::path::PathBuf,
     },
     DropObject(DbObjectRef),
     RenameObject {
@@ -425,6 +437,62 @@ impl DbWorker {
                                     let _ = res_tx.send(DbResponse::Busy(false));
                                 }
                             }
+                            DbRequest::BackupDatabase { db_name, file_path } => {
+                                if let Some(cfg) = &current_cfg {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    match backup_database(cfg, &db_name, &file_path) {
+                                        Ok(()) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: format!(
+                                                    "Database '{}' backed up to {}",
+                                                    db_name,
+                                                    file_path.display()
+                                                ),
+                                                refresh_tables: false,
+                                                refresh_columns: false,
+                                            });
+                                        }
+                                        Err(error) => {
+                                            let _ =
+                                                res_tx.send(DbResponse::OperationFailed(error));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                } else {
+                                    let _ = res_tx.send(DbResponse::OperationFailed(
+                                        "Connect to a PostgreSQL server before backing up a database"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                            DbRequest::RestoreDatabase { db_name, file_path } => {
+                                if let Some(cfg) = &current_cfg {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    match restore_database(cfg, &db_name, &file_path) {
+                                        Ok(()) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: format!(
+                                                    "Database '{}' restored from {}",
+                                                    db_name,
+                                                    file_path.display()
+                                                ),
+                                                refresh_tables: cfg.database == db_name,
+                                                refresh_columns: false,
+                                            });
+                                        }
+                                        Err(error) => {
+                                            let _ =
+                                                res_tx.send(DbResponse::OperationFailed(error));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                } else {
+                                    let _ = res_tx.send(DbResponse::OperationFailed(
+                                        "Connect to a PostgreSQL server before restoring a database"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
                             DbRequest::DropObject(object) => {
                                 if let Some(client) = &current_client {
                                     let _ = res_tx.send(DbResponse::Busy(true));
@@ -634,6 +702,124 @@ async fn connect_client(cfg: &ConnectionConfig) -> Result<(Client, String), Stri
         .unwrap_or_else(|| "PostgreSQL (Unknown version)".to_string());
 
     Ok((client, version))
+}
+
+fn backup_database(cfg: &ConnectionConfig, database: &str, file_path: &Path) -> Result<(), String> {
+    let mut command = postgres_tool("pg_dump");
+    command
+        .arg("--format=custom")
+        .arg("--no-password")
+        .arg("--host")
+        .arg(&cfg.host)
+        .arg("--port")
+        .arg(cfg.port.to_string())
+        .arg("--username")
+        .arg(&cfg.username)
+        .arg("--dbname")
+        .arg(database)
+        .arg("--file")
+        .arg(file_path);
+    set_tool_password(&mut command, &cfg.password);
+    run_postgres_tool(command, "pg_dump")
+}
+
+fn restore_database(
+    cfg: &ConnectionConfig,
+    database: &str,
+    file_path: &Path,
+) -> Result<(), String> {
+    if !file_path.is_file() {
+        return Err(format!(
+            "Backup file does not exist or is not a regular file: {}",
+            file_path.display()
+        ));
+    }
+
+    let is_sql_file = is_plain_sql_backup(file_path);
+    let tool = if is_sql_file { "psql" } else { "pg_restore" };
+    let mut command = postgres_tool(tool);
+    command
+        .arg("--no-password")
+        .arg("--host")
+        .arg(&cfg.host)
+        .arg("--port")
+        .arg(cfg.port.to_string())
+        .arg("--username")
+        .arg(&cfg.username)
+        .arg("--dbname")
+        .arg(database);
+
+    if is_sql_file {
+        command
+            .arg("--set=ON_ERROR_STOP=on")
+            .arg("--file")
+            .arg(file_path);
+    } else {
+        command.arg("--exit-on-error").arg(file_path);
+    }
+    set_tool_password(&mut command, &cfg.password);
+    run_postgres_tool(command, tool)
+}
+
+fn is_plain_sql_backup(file_path: &Path) -> bool {
+    file_path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("sql"))
+}
+
+fn postgres_tool(name: &str) -> Command {
+    #[cfg(target_os = "windows")]
+    let executable = format!("{name}.exe");
+    #[cfg(not(target_os = "windows"))]
+    let executable = name.to_string();
+    Command::new(executable)
+}
+
+fn set_tool_password(command: &mut Command, password: &str) {
+    if password.is_empty() {
+        command.env_remove("PGPASSWORD");
+    } else {
+        command.env("PGPASSWORD", password);
+    }
+}
+
+fn run_postgres_tool(mut command: Command, tool: &str) -> Result<(), String> {
+    command.stdout(Stdio::null());
+    let output = command.output().map_err(|error| {
+        format!(
+            "Could not start {}: {}. Install the PostgreSQL client utilities and make sure {} is available on PATH.",
+            tool, error, tool
+        )
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let details = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "{} failed with status {}{}",
+        tool,
+        output.status,
+        if details.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {}", details.trim())
+        }
+    ))
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::is_plain_sql_backup;
+    use std::path::Path;
+
+    #[test]
+    fn identifies_plain_sql_backups_case_insensitively() {
+        assert!(is_plain_sql_backup(Path::new("backup.sql")));
+        assert!(is_plain_sql_backup(Path::new("backup.SQL")));
+        assert!(!is_plain_sql_backup(Path::new("backup.dump")));
+        assert!(!is_plain_sql_backup(Path::new("backup.tar")));
+    }
 }
 
 async fn fetch_databases_impl(

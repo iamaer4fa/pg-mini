@@ -55,6 +55,12 @@ pub enum SidebarAction {
     ConfirmDropDatabase {
         db_name: String,
     },
+    BackupDatabase {
+        db_name: String,
+    },
+    RestoreDatabase {
+        db_name: String,
+    },
     RefreshTables,
     RequestSchemas {
         database: String,
@@ -300,6 +306,19 @@ impl Sidebar {
                                             action = Some(SidebarAction::OpenSql(
                                                 database_ref.properties_sql(),
                                             ));
+                                            ui.close_menu();
+                                        }
+                                        ui.separator();
+                                        if ui.button("Backup...").clicked() {
+                                            action = Some(SidebarAction::BackupDatabase {
+                                                db_name: database.name.clone(),
+                                            });
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Restore...").clicked() {
+                                            action = Some(SidebarAction::RestoreDatabase {
+                                                db_name: database.name.clone(),
+                                            });
                                             ui.close_menu();
                                         }
                                         if !is_current && ui.button("Rename").clicked() {
@@ -848,6 +867,20 @@ impl Sidebar {
 
                                 if ui.button("🔄 Refresh Tables").clicked() {
                                     action = Some(SidebarAction::RefreshTables);
+                                    ui.close_menu();
+                                }
+
+                                ui.separator();
+                                if ui.button("Backup...").clicked() {
+                                    action = Some(SidebarAction::BackupDatabase {
+                                        db_name: db.name.clone(),
+                                    });
+                                    ui.close_menu();
+                                }
+                                if ui.button("Restore...").clicked() {
+                                    action = Some(SidebarAction::RestoreDatabase {
+                                        db_name: db.name.clone(),
+                                    });
                                     ui.close_menu();
                                 }
 

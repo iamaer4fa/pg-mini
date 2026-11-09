@@ -45,6 +45,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
   - `⚡ Open Query Tool`: Opens SQL Editor targeting this database.
   - `➕ Create Table...`: Launches a quick table creation modal.
   - `🔄 Refresh Tables`: Reloads schema objects.
+  - `Backup...` / `Restore...`: Save custom-format database backups and restore PostgreSQL archives or plain SQL scripts.
   - `🗑️ Drop Database...`: Drops the database with confirmation (protected against dropping active DB).
 - **Multiple Live Servers**: Connect to several PostgreSQL servers at once, switch the active server from the top bar, and keep each server connected while working with another.
 - **Profile Management**: Save and switch between multiple PostgreSQL connection profiles (Host, Port, Database, Username, Password).
@@ -139,6 +140,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 - Windows 10 or later
 - macOS 11 or later (Apple silicon and Intel Macs)
 - Wayland or X11 desktop session on Linux
+- PostgreSQL client utilities (`pg_dump`, `pg_restore`, and `psql`) installed and available on `PATH` for database backup and restore
 - Rust & Cargo (only if building from source)
 
 ### 1. Quick Launch
@@ -169,7 +171,7 @@ Build a Debian package (including the desktop launcher and lightning icon):
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./target/debian/pg-mini_0.1.4_amd64.deb
+sudo apt install ./target/debian/pg-mini_0.1.5_amd64.deb
 ```
 
 The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop application launcher, and installs the icon in the hicolor icon theme.
@@ -180,11 +182,11 @@ To create a desktop shortcut manually, set `Exec` to the built executable and `I
 
 ## 🚀 Build Packages on GitHub
 
-The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.4`):
+The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.5`):
 
 ```bash
-git tag v0.1.4
-git push origin v0.1.4
+git tag v0.1.5
+git push origin v0.1.5
 ```
 
 Once all platform builds finish, GitHub publishes a Release with the Linux, Windows, and macOS downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.
@@ -194,6 +196,8 @@ On Windows, the app checks whether the current session can create an OpenGL 2.0 
 To keep multiple PostgreSQL servers connected, choose **➕ Connect Server** and connect another saved or new profile. Use the server selector in the top bar to switch which connection the object browser and SQL editor use; switching does not disconnect the other servers. **Disconnect** disconnects only the currently selected server.
 
 On macOS, download the matching `arm64` (Apple silicon) or `x64` (Intel) `.dmg` from the GitHub Release, open it, and drag **pg-mini** into **Applications**. The app is currently unsigned and not notarized, so macOS may require you to allow it in **System Settings → Privacy & Security** the first time it is opened.
+
+Backup and restore call the PostgreSQL client utilities (`pg_dump`, `pg_restore`, or `psql`) installed on your computer. Install PostgreSQL command-line tools separately and make sure their `bin` directory is on `PATH`. Backups are custom-format `.dump` files; restore also accepts PostgreSQL custom/tar archives and plain `.sql` files. Restore does not use `pg_restore --clean`, but SQL files and archive contents can still change or drop database objects.
 
 ---
 

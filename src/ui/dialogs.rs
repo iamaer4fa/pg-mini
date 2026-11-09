@@ -287,13 +287,26 @@ pub fn render_confirm_dialog(
             ui.set_min_width(400.0);
 
             ui.horizontal(|ui| {
-                ui.label(RichText::new("⚠ Warning").color(Color32::LIGHT_RED).strong().size(16.0));
+                let is_restore = matches!(
+                    state.action.as_ref(),
+                    Some(crate::models::ConfirmAction::RestoreDatabase { .. })
+                );
+                ui.label(RichText::new(if is_restore { "⚠ Confirm Restore" } else { "⚠ Warning" })
+                    .color(Color32::LIGHT_RED).strong().size(16.0));
             });
             ui.separator();
             ui.add_space(6.0);
 
             ui.label(&state.message);
-            ui.label(RichText::new("This action is permanent and cannot be undone.").size(11.0).color(Color32::GRAY));
+            let is_restore = matches!(
+                state.action.as_ref(),
+                Some(crate::models::ConfirmAction::RestoreDatabase { .. })
+            );
+            ui.label(RichText::new(if is_restore {
+                "Restoring may permanently change or delete database data."
+            } else {
+                "This action is permanent and cannot be undone."
+            }).size(11.0).color(Color32::GRAY));
 
             ui.add_space(12.0);
             ui.separator();
@@ -305,10 +318,15 @@ pub fn render_confirm_dialog(
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let is_restore = matches!(
+                        state.action.as_ref(),
+                        Some(crate::models::ConfirmAction::RestoreDatabase { .. })
+                    );
                     let confirm_btn = ui.add_enabled(
                         !is_busy,
-                        egui::Button::new(RichText::new("Yes, Delete").strong().color(Color32::WHITE))
-                            .fill(Color32::from_rgb(185, 35, 35))
+                        egui::Button::new(RichText::new(if is_restore { "Restore Database" } else { "Yes, Delete" })
+                            .strong().color(Color32::WHITE))
+                            .fill(if is_restore { Color32::from_rgb(16, 145, 90) } else { Color32::from_rgb(185, 35, 35) })
                             .rounding(egui::Rounding::same(6.0)),
                     );
 

@@ -619,7 +619,7 @@ impl eframe::App for PgMiniApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("v0.1.4").size(11.0).color(Color32::DARK_GRAY));
+                    ui.label(RichText::new("v0.1.5").size(11.0).color(Color32::DARK_GRAY));
                 });
             });
         });
@@ -717,6 +717,39 @@ impl eframe::App for PgMiniApp {
                                 message: format!("Are you sure you want to permanently delete database '{}'?", db_name),
                                 action: Some(ConfirmAction::DropDatabase { db_name }),
                             };
+                        }
+                        SidebarAction::BackupDatabase { db_name } => {
+                            if let Some(file_path) = rfd::FileDialog::new()
+                                .add_filter("PostgreSQL custom backup", &["dump"])
+                                .set_file_name(format!("{db_name}.dump"))
+                                .save_file()
+                            {
+                                self.db_worker.send(DbRequest::BackupDatabase {
+                                    db_name,
+                                    file_path,
+                                });
+                            }
+                        }
+                        SidebarAction::RestoreDatabase { db_name } => {
+                            if let Some(file_path) = rfd::FileDialog::new()
+                                .add_filter("PostgreSQL backups", &["dump", "backup", "tar"])
+                                .add_filter("SQL scripts", &["sql"])
+                                .pick_file()
+                            {
+                                self.confirm_dialog = ConfirmDialogState {
+                                    is_open: true,
+                                    title: "Restore Database".to_string(),
+                                    message: format!(
+                                        "Restore '{}' from '{}'? This executes the backup against the selected database and may modify or replace its objects and data.",
+                                        db_name,
+                                        file_path.display()
+                                    ),
+                                    action: Some(ConfirmAction::RestoreDatabase {
+                                        db_name,
+                                        file_path,
+                                    }),
+                                };
+                            }
                         }
                         SidebarAction::RefreshTables => {
                             self.tables.clear();
@@ -1031,6 +1064,10 @@ impl eframe::App for PgMiniApp {
                 ConfirmAction::DropDatabase { db_name } => {
                     self.db_worker.send(DbRequest::DropDatabase { db_name });
                 }
+                ConfirmAction::RestoreDatabase { db_name, file_path } => {
+                    self.db_worker
+                        .send(DbRequest::RestoreDatabase { db_name, file_path });
+                }
                 ConfirmAction::DropObject { object } => {
                     self.db_worker.send(DbRequest::DropObject(object));
                 }
@@ -1099,7 +1136,7 @@ impl eframe::App for PgMiniApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.set_min_width(340.0);
-                    ui.heading("⚡ pg-mini v0.1.4");
+                    ui.heading("⚡ pg-mini v0.1.5");
                     ui.label("Ultra-lightweight native PostgreSQL manager.");
                     ui.add_space(8.0);
                     ui.label("Built with Rust + egui/eframe + tokio-postgres.");
