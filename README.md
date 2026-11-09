@@ -102,6 +102,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 - **Performance Timer**: Displays query execution time in milliseconds and row counts (`⚡ 3.4 ms | 120 rows returned`).
 - **Quick Snippets**: Dropdown with ready-to-use SQL templates (Server Info, Database Sizes, Table Counts, etc.).
 - **pgAdmin-Style Admin Insights**: One-click query plans (`EXPLAIN`, without executing the query), active sessions, blocked sessions, database statistics, and database roles in the normal result grid.
+- **Users & Roles Management**: Create, edit, filter, and drop PostgreSQL login roles (users) and non-login group roles; configure passwords, role attributes, group-role membership, connection limits, and validity timestamps. PostgreSQL still enforces the connected account's role-administration privileges.
 - **Persistent Query History**: Keeps the latest 200 distinct queries in the app configuration, with search, load-into-editor, and copy actions.
 - **Error Reporting**: Clear, highlighted PostgreSQL error banners when syntax or constraints fail.
 
@@ -171,7 +172,7 @@ Build a Debian package (including the desktop launcher and lightning icon):
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./target/debian/pg-mini_0.1.5_amd64.deb
+sudo apt install ./target/debian/pg-mini_0.1.6_amd64.deb
 ```
 
 The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop application launcher, and installs the icon in the hicolor icon theme.
@@ -182,11 +183,11 @@ To create a desktop shortcut manually, set `Exec` to the built executable and `I
 
 ## 🚀 Build Packages on GitHub
 
-The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.5`):
+The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.6`):
 
 ```bash
-git tag v0.1.5
-git push origin v0.1.5
+git tag v0.1.6
+git push origin v0.1.6
 ```
 
 Once all platform builds finish, GitHub publishes a Release with the Linux, Windows, and macOS downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.

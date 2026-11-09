@@ -8,7 +8,8 @@ use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 use crate::models::{
     AddColumnForm, CellValue, ColumnItem, ConnectionConfig, CreateTableForm, DatabaseItem,
-    DbObjectItem, DbObjectKind, DbObjectRef, EditableCell, ObjectTreeKey, QueryResult, TableItem,
+    DbObjectItem, DbObjectKind, DbObjectRef, EditableCell, ObjectTreeKey, QueryResult, RoleForm,
+    RoleItem, TableItem,
 };
 
 #[derive(Debug)]
@@ -16,6 +17,9 @@ pub enum DbRequest {
     Connect(ConnectionConfig),
     Disconnect,
     FetchDatabases,
+    FetchRoles,
+    SaveRole(RoleForm),
+    DropRole(String),
     SwitchDatabase(String),
     FetchSchemas {
         database: String,
@@ -95,6 +99,7 @@ pub enum DbResponse {
     ConnectionFailed(String),
     Disconnected,
     DatabasesFetched(Result<Vec<DatabaseItem>, String>),
+    RolesFetched(Result<Vec<RoleItem>, String>),
     SchemasFetched {
         database: String,
         result: Result<Vec<String>, String>,
@@ -182,6 +187,70 @@ impl DbWorker {
                                         .unwrap_or("");
                                     let result = fetch_databases_impl(client, active_db).await;
                                     let _ = res_tx.send(DbResponse::DatabasesFetched(result));
+                                }
+                            }
+                            DbRequest::FetchRoles => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    let result = fetch_roles_impl(client).await;
+                                    let _ = res_tx.send(DbResponse::RolesFetched(result));
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::SaveRole(form) => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    match save_role_impl(client, &form).await {
+                                        Ok(()) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: format!(
+                                                    "Role '{}' saved successfully",
+                                                    form.name.trim()
+                                                ),
+                                                refresh_tables: false,
+                                                refresh_columns: false,
+                                            });
+                                            let _ = res_tx.send(DbResponse::RolesFetched(
+                                                fetch_roles_impl(client).await,
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            let _ = res_tx.send(DbResponse::OperationFailed(
+                                                format!("Failed to save role: {error}"),
+                                            ));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::DropRole(role_name) => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    let sql = format!(
+                                        "DROP ROLE {};",
+                                        quote_role_ident(role_name.trim())
+                                    );
+                                    match client.simple_query(&sql).await {
+                                        Ok(_) => {
+                                            let _ = res_tx.send(DbResponse::OperationSuccess {
+                                                message: format!(
+                                                    "Role '{}' dropped successfully",
+                                                    role_name
+                                                ),
+                                                refresh_tables: false,
+                                                refresh_columns: false,
+                                            });
+                                            let _ = res_tx.send(DbResponse::RolesFetched(
+                                                fetch_roles_impl(client).await,
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            let _ = res_tx.send(DbResponse::OperationFailed(
+                                                format!("Failed to drop role: {error}"),
+                                            ));
+                                        }
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(false));
                                 }
                             }
                             DbRequest::SwitchDatabase(db_name) => {
@@ -808,9 +877,201 @@ fn run_postgres_tool(mut command: Command, tool: &str) -> Result<(), String> {
     ))
 }
 
+async fn fetch_roles_impl(client: &Client) -> Result<Vec<RoleItem>, String> {
+    let rows = client
+        .simple_query(
+            "SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, \
+             rolinherit, rolreplication, rolbypassrls, rolconnlimit, \
+             CASE WHEN rolvaliduntil = 'infinity'::timestamptz THEN NULL \
+                  ELSE rolvaliduntil::text END \
+             FROM pg_catalog.pg_roles ORDER BY rolname;",
+        )
+        .await
+        .map_err(|error| format!("Failed to fetch PostgreSQL roles: {error}"))?;
+
+    let mut roles: Vec<RoleItem> = rows
+        .into_iter()
+        .filter_map(|row| match row {
+            SimpleQueryMessage::Row(row) => Some(parse_role_row(&row)),
+            _ => None,
+        })
+        .collect::<Result<_, _>>()?;
+    let membership_rows = client
+        .simple_query(
+            "SELECT member.rolname, granted.rolname \
+             FROM pg_catalog.pg_auth_members AS membership \
+             JOIN pg_catalog.pg_roles AS member ON member.oid = membership.member \
+             JOIN pg_catalog.pg_roles AS granted ON granted.oid = membership.roleid \
+             ORDER BY member.rolname, granted.rolname;",
+        )
+        .await
+        .map_err(|error| format!("Failed to fetch role memberships: {error}"))?;
+
+    for row in membership_rows {
+        if let SimpleQueryMessage::Row(row) = row {
+            if let (Some(member), Some(granted)) = (row.get(0), row.get(1)) {
+                if let Some(role) = roles.iter_mut().find(|role| role.name == member) {
+                    role.memberships.push(granted.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(roles)
+}
+
+fn parse_role_row(row: &tokio_postgres::SimpleQueryRow) -> Result<RoleItem, String> {
+    let name = row
+        .get(0)
+        .ok_or_else(|| "Role query returned a row without a name".to_string())?;
+    let boolean = |index| match row.get(index) {
+        Some("t") => Ok(true),
+        Some("f") => Ok(false),
+        value => Err(format!("Invalid role flag value: {value:?}")),
+    };
+    let connection_limit = row
+        .get(8)
+        .and_then(|value| value.parse::<i32>().ok())
+        .ok_or_else(|| format!("Invalid connection limit for role '{name}'"))?;
+
+    Ok(RoleItem {
+        name: name.to_string(),
+        memberships: Vec::new(),
+        can_login: boolean(1)?,
+        is_superuser: boolean(2)?,
+        can_create_db: boolean(3)?,
+        can_create_role: boolean(4)?,
+        can_inherit: boolean(5)?,
+        can_replicate: boolean(6)?,
+        can_bypass_rls: boolean(7)?,
+        connection_limit,
+        valid_until: row.get(9).map(str::to_string),
+    })
+}
+
+fn role_sql(form: &RoleForm) -> Result<Vec<String>, String> {
+    let name = form.name.trim();
+    if name.is_empty() || name.contains('\0') {
+        return Err("Role name must not be empty or contain a NUL character".to_string());
+    }
+    if form.password.contains('\0') {
+        return Err("Password must not contain a NUL character".to_string());
+    }
+    let connection_limit = form
+        .connection_limit
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| "Connection limit must be -1 (unlimited) or a non-negative integer".to_string())?;
+    if connection_limit < -1 {
+        return Err("Connection limit must be -1 (unlimited) or a non-negative integer".to_string());
+    }
+
+    let valid_until = form.valid_until.trim();
+    if valid_until.contains('\0') {
+        return Err("Validity timestamp must not contain a NUL character".to_string());
+    }
+
+    let role_ident = quote_role_ident(name);
+    let old_name = form.original_name.as_deref().map(str::trim);
+    if old_name.is_some_and(|old| old.is_empty() || old.contains('\0')) {
+        return Err("Original role name is invalid".to_string());
+    }
+
+    let flags = format!(
+        "{} {} {} {} {} {} {} CONNECTION LIMIT {} VALID UNTIL {}",
+        if form.can_login { "LOGIN" } else { "NOLOGIN" },
+        if form.is_superuser { "SUPERUSER" } else { "NOSUPERUSER" },
+        if form.can_create_db { "CREATEDB" } else { "NOCREATEDB" },
+        if form.can_create_role { "CREATEROLE" } else { "NOCREATEROLE" },
+        if form.can_inherit { "INHERIT" } else { "NOINHERIT" },
+        if form.can_replicate { "REPLICATION" } else { "NOREPLICATION" },
+        if form.can_bypass_rls { "BYPASSRLS" } else { "NOBYPASSRLS" },
+        connection_limit,
+        if valid_until.is_empty() {
+            "'infinity'".to_string()
+        } else {
+            role_sql_literal(valid_until)
+        }
+    );
+
+    let mut statements = Vec::new();
+    if let Some(old_name) = old_name.filter(|old| *old != name) {
+        statements.push(format!(
+            "ALTER ROLE {} RENAME TO {};",
+            quote_role_ident(old_name),
+            role_ident
+        ));
+    }
+
+    if let Some(old_name) = old_name {
+        let target = if old_name == name {
+            role_ident
+        } else {
+            quote_role_ident(name)
+        };
+        let password = if form.password.is_empty() {
+            String::new()
+        } else {
+            format!(" PASSWORD {}", role_sql_literal(&form.password))
+        };
+        statements.push(format!("ALTER ROLE {target} WITH {flags}{password};"));
+        for membership in &form.memberships {
+            if !form.original_memberships.contains(membership) {
+                statements.push(format!(
+                    "GRANT {} TO {};",
+                    quote_role_ident(membership),
+                    quote_role_ident(name)
+                ));
+            }
+        }
+        for membership in &form.original_memberships {
+            if !form.memberships.contains(membership) {
+                statements.push(format!(
+                    "REVOKE {} FROM {};",
+                    quote_role_ident(membership),
+                    quote_role_ident(name)
+                ));
+            }
+        }
+    } else {
+        let password = if form.password.is_empty() {
+            String::new()
+        } else {
+            format!(" PASSWORD {}", role_sql_literal(&form.password))
+        };
+        statements.push(format!("CREATE ROLE {role_ident} WITH {flags}{password};"));
+        for membership in &form.memberships {
+            statements.push(format!(
+                "GRANT {} TO {};",
+                quote_role_ident(membership),
+                quote_role_ident(name)
+            ));
+        }
+    }
+    Ok(statements)
+}
+
+fn role_sql_literal(value: &str) -> String {
+    format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+fn quote_role_ident(value: &str) -> String {
+    format!("\"{}\"", escape_sql_ident(value))
+}
+
+async fn save_role_impl(client: &Client, form: &RoleForm) -> Result<(), String> {
+    let sql = role_sql(form)?.join("\n");
+    client
+        .simple_query(&sql)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
-mod backup_tests {
-    use super::is_plain_sql_backup;
+mod db_tests {
+    use super::{is_plain_sql_backup, role_sql};
+    use crate::models::RoleForm;
     use std::path::Path;
 
     #[test]
@@ -819,6 +1080,51 @@ mod backup_tests {
         assert!(is_plain_sql_backup(Path::new("backup.SQL")));
         assert!(!is_plain_sql_backup(Path::new("backup.dump")));
         assert!(!is_plain_sql_backup(Path::new("backup.tar")));
+    }
+
+    #[test]
+    fn role_sql_quotes_names_and_passwords() {
+        let mut form = RoleForm::new();
+        form.name = "user\" name".to_string();
+        form.password = "p\\ass'word".to_string();
+        let sql = role_sql(&form).unwrap().join("\n");
+        assert!(sql.starts_with("CREATE ROLE \"user\"\" name\" WITH LOGIN"));
+        assert!(sql.contains("PASSWORD E'p\\\\ass''word'"));
+        assert!(!sql.contains("p\\ass'word';"));
+    }
+
+    #[test]
+    fn role_sql_validates_connection_limit() {
+        let mut form = RoleForm::new();
+        form.connection_limit = "-2".to_string();
+        assert!(role_sql(&form).is_err());
+    }
+
+    #[test]
+    fn role_sql_changes_existing_role_without_resetting_password() {
+        let mut form = RoleForm::new();
+        form.original_name = Some("old_role".to_string());
+        form.name = "new_role".to_string();
+        let statements = role_sql(&form).unwrap();
+        assert!(statements[0].contains("RENAME TO \"new_role\""));
+        assert!(statements[1].starts_with("ALTER ROLE \"new_role\" WITH"));
+        assert!(!statements[1].contains("PASSWORD"));
+    }
+
+    #[test]
+    fn role_sql_updates_group_memberships() {
+        let mut form = RoleForm::new();
+        form.original_name = Some("app_user".to_string());
+        form.name = "app_user".to_string();
+        form.original_memberships = vec!["old_group".to_string()];
+        form.memberships = vec!["new_group".to_string()];
+        let statements = role_sql(&form).unwrap();
+        assert!(statements.iter().any(|sql| {
+            sql == "GRANT \"new_group\" TO \"app_user\";"
+        }));
+        assert!(statements.iter().any(|sql| {
+            sql == "REVOKE \"old_group\" FROM \"app_user\";"
+        }));
     }
 }
 

@@ -477,6 +477,79 @@ impl CreateTableForm {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoleItem {
+    pub name: String,
+    pub memberships: Vec<String>,
+    pub can_login: bool,
+    pub is_superuser: bool,
+    pub can_create_db: bool,
+    pub can_create_role: bool,
+    pub can_inherit: bool,
+    pub can_replicate: bool,
+    pub can_bypass_rls: bool,
+    pub connection_limit: i32,
+    pub valid_until: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoleForm {
+    pub original_name: Option<String>,
+    pub original_memberships: Vec<String>,
+    pub name: String,
+    pub memberships: Vec<String>,
+    pub password: String,
+    pub can_login: bool,
+    pub is_superuser: bool,
+    pub can_create_db: bool,
+    pub can_create_role: bool,
+    pub can_inherit: bool,
+    pub can_replicate: bool,
+    pub can_bypass_rls: bool,
+    pub connection_limit: String,
+    pub valid_until: String,
+}
+
+impl RoleForm {
+    pub fn new() -> Self {
+        Self {
+            original_name: None,
+            original_memberships: Vec::new(),
+            name: String::new(),
+            memberships: Vec::new(),
+            password: String::new(),
+            can_login: true,
+            is_superuser: false,
+            can_create_db: false,
+            can_create_role: false,
+            can_inherit: true,
+            can_replicate: false,
+            can_bypass_rls: false,
+            connection_limit: "-1".to_string(),
+            valid_until: String::new(),
+        }
+    }
+
+    pub fn from_role(role: &RoleItem) -> Self {
+        Self {
+            original_name: Some(role.name.clone()),
+            original_memberships: role.memberships.clone(),
+            name: role.name.clone(),
+            memberships: role.memberships.clone(),
+            password: String::new(),
+            can_login: role.can_login,
+            is_superuser: role.is_superuser,
+            can_create_db: role.can_create_db,
+            can_create_role: role.can_create_role,
+            can_inherit: role.can_inherit,
+            can_replicate: role.can_replicate,
+            can_bypass_rls: role.can_bypass_rls,
+            connection_limit: role.connection_limit.to_string(),
+            valid_until: role.valid_until.clone().unwrap_or_default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
     DropTable {
@@ -494,6 +567,9 @@ pub enum ConfirmAction {
     },
     DropDatabase {
         db_name: String,
+    },
+    DropRole {
+        role_name: String,
     },
     RestoreDatabase {
         db_name: String,

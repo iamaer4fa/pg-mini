@@ -5,12 +5,13 @@ use crate::config::ConfigManager;
 use crate::db::{DbRequest, DbResponse, DbWorker};
 use crate::models::{
     AppConfig, CellValue, ColumnItem, ConfirmAction, ConfirmDialogState, DatabaseItem,
-    DbObjectKind, DbObjectRef, EditableCell, QueryResult, TableItem,
+    DbObjectKind, DbObjectRef, EditableCell, QueryResult, RoleItem, TableItem,
 };
 use crate::ui::columns_view::{ColumnsViewAction, render_columns_view};
 use crate::ui::connection_modal::ConnectionModal;
 use crate::ui::data_table::{DataTableAction, DataTableState, export_to_csv, render_data_table};
 use crate::ui::dialogs::{AddColumnModal, CreateTableModal, render_confirm_dialog};
+use crate::ui::roles::{RolesAction, RolesViewState};
 use crate::ui::sidebar::{Sidebar, SidebarAction};
 use crate::ui::sql_editor::{SqlEditor, SqlEditorAction};
 use crate::ui::theme::setup_custom_theme;
@@ -20,6 +21,7 @@ pub enum ActiveTab {
     TableView,
     SqlEditor,
     SchemaView,
+    Roles,
 }
 
 pub struct Toast {
@@ -57,6 +59,8 @@ pub struct PgMiniApp {
     current_table_data: Option<QueryResult>,
     table_data_state: DataTableState,
     current_columns: Vec<ColumnItem>,
+    roles: Vec<RoleItem>,
+    roles_view: RolesViewState,
     sql_editor: SqlEditor,
     last_query_result: Option<Result<QueryResult, String>>,
 
@@ -114,6 +118,8 @@ impl PgMiniApp {
             current_table_data: None,
             table_data_state: DataTableState::default(),
             current_columns: Vec::new(),
+            roles: Vec::new(),
+            roles_view: RolesViewState::default(),
             sql_editor,
             last_query_result: None,
             add_column_modal: AddColumnModal::default(),
@@ -142,6 +148,7 @@ impl PgMiniApp {
         self.selected_table = None;
         self.current_table_data = None;
         self.current_columns.clear();
+        self.roles.clear();
         self.last_query_result = None;
         self.table_data_state = DataTableState::default();
         self.sidebar.reset_object_tree();
@@ -224,6 +231,9 @@ impl PgMiniApp {
         self.pending_connection = None;
         self.connection_modal.is_open = false;
         self.reset_active_server_view();
+        if self.active_tab == ActiveTab::Roles {
+            self.db_worker.send(DbRequest::FetchRoles);
+        }
         self.db_worker.send(DbRequest::FetchDatabases);
     }
 
@@ -243,6 +253,7 @@ impl PgMiniApp {
                     DbResponse::QueryResult(Err(error))
                     | DbResponse::TableDataResult(Err(error))
                     | DbResponse::DatabasesFetched(Err(error))
+                    | DbResponse::RolesFetched(Err(error))
                     | DbResponse::SchemasFetched {
                         result: Err(error), ..
                     }
@@ -287,6 +298,9 @@ impl PgMiniApp {
                     );
                     self.sidebar.reset_object_tree();
                     self.db_worker.send(DbRequest::FetchDatabases);
+                    if self.active_tab == ActiveTab::Roles {
+                        self.db_worker.send(DbRequest::FetchRoles);
+                    }
                 }
                 DbResponse::ConnectionFailed(err) => {
                     self.is_connected = false;
@@ -309,6 +323,10 @@ impl PgMiniApp {
                     Err(e) => {
                         self.show_toast(format!("Error fetching databases: {}", e), true);
                     }
+                },
+                DbResponse::RolesFetched(result) => match result {
+                    Ok(roles) => self.roles = roles,
+                    Err(error) => self.show_toast(error, true),
                 },
                 DbResponse::SchemasFetched { database, result } => {
                     if database == self.current_db {
@@ -619,7 +637,7 @@ impl eframe::App for PgMiniApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("v0.1.5").size(11.0).color(Color32::DARK_GRAY));
+                    ui.label(RichText::new("v0.1.6").size(11.0).color(Color32::DARK_GRAY));
                 });
             });
         });
@@ -823,6 +841,16 @@ impl eframe::App for PgMiniApp {
                 if ui.selectable_label(self.active_tab == ActiveTab::SchemaView, schema_tab_label).clicked() {
                     self.active_tab = ActiveTab::SchemaView;
                 }
+
+                if ui
+                    .selectable_label(self.active_tab == ActiveTab::Roles, "👤 Users & Roles")
+                    .clicked()
+                {
+                    self.active_tab = ActiveTab::Roles;
+                    if self.is_connected {
+                        self.db_worker.send(DbRequest::FetchRoles);
+                    }
+                }
             });
 
             ui.separator();
@@ -1020,6 +1048,32 @@ impl eframe::App for PgMiniApp {
                         }
                     }
                 }
+                ActiveTab::Roles => {
+                    if !self.is_connected {
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Connect to a PostgreSQL server to manage users and roles.");
+                        });
+                    } else if let Some(action) =
+                        self.roles_view.render(ui, &self.roles, self.is_busy)
+                    {
+                        match action {
+                            RolesAction::Refresh => self.db_worker.send(DbRequest::FetchRoles),
+                            RolesAction::Save(form) => {
+                                self.db_worker.send(DbRequest::SaveRole(form))
+                            }
+                            RolesAction::Drop(role_name) => {
+                                self.confirm_dialog = ConfirmDialogState {
+                                    is_open: true,
+                                    title: "Drop PostgreSQL Role".to_string(),
+                                    message: format!(
+                                        "Drop role '{role_name}'? PostgreSQL will reject this if the role still owns objects or has privileges that must be reassigned or revoked."
+                                    ),
+                                    action: Some(ConfirmAction::DropRole { role_name }),
+                                };
+                            }
+                        }
+                    }
+                }
             }
         });
 
@@ -1063,6 +1117,9 @@ impl eframe::App for PgMiniApp {
                 }
                 ConfirmAction::DropDatabase { db_name } => {
                     self.db_worker.send(DbRequest::DropDatabase { db_name });
+                }
+                ConfirmAction::DropRole { role_name } => {
+                    self.db_worker.send(DbRequest::DropRole(role_name));
                 }
                 ConfirmAction::RestoreDatabase { db_name, file_path } => {
                     self.db_worker
@@ -1136,7 +1193,7 @@ impl eframe::App for PgMiniApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.set_min_width(340.0);
-                    ui.heading("⚡ pg-mini v0.1.5");
+                    ui.heading("⚡ pg-mini v0.1.6");
                     ui.label("Ultra-lightweight native PostgreSQL manager.");
                     ui.add_space(8.0);
                     ui.label("Built with Rust + egui/eframe + tokio-postgres.");
