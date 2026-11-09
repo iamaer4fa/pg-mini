@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::io::BufReader;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
 use std::{
@@ -10,7 +12,7 @@ use crate::activity::{ActivityLock, ActivitySession, ActivitySnapshot, SizeEntry
 use crate::models::{
     AddColumnForm, CellValue, ColumnItem, ConnectionConfig, CreateTableForm, DatabaseItem,
     DbObjectItem, DbObjectKind, DbObjectRef, EditableCell, ObjectTreeKey, QueryResult, RoleForm,
-    RoleItem, TableItem,
+    RoleItem, TableItem, TlsMode,
 };
 
 #[derive(Debug)]
@@ -783,6 +785,44 @@ impl DbWorker {
 }
 
 async fn connect_client(cfg: &ConnectionConfig) -> Result<(Client, String), String> {
+    let pg_config = postgres_config(cfg);
+    match cfg.tls_mode {
+        TlsMode::Disable => {
+            let (client, connection) = pg_config
+                .connect(NoTls)
+                .await
+                .map_err(|error| format!("Failed to connect: {error}"))?;
+            finish_connection(client, connection).await
+        }
+        TlsMode::Prefer => {
+            let tls = tls_connector(cfg)?;
+            match pg_config.connect(tls).await {
+                Ok((client, connection)) => finish_connection(client, connection).await,
+                Err(tls_error) if tls_error.as_db_error().is_some() => Err(format!(
+                    "PostgreSQL rejected the TLS connection: {tls_error}"
+                )),
+                Err(tls_error) => {
+                    let (client, connection) = pg_config.connect(NoTls).await.map_err(|plain_error| {
+                        format!(
+                            "TLS connection failed ({tls_error}); plaintext fallback also failed ({plain_error})"
+                        )
+                    })?;
+                    finish_connection(client, connection).await
+                }
+            }
+        }
+        TlsMode::Require => {
+            let tls = tls_connector(cfg)?;
+            let (client, connection) = pg_config
+                .connect(tls)
+                .await
+                .map_err(|error| format!("TLS connection failed: {error}"))?;
+            finish_connection(client, connection).await
+        }
+    }
+}
+
+fn postgres_config(cfg: &ConnectionConfig) -> tokio_postgres::Config {
     let mut pg_config = tokio_postgres::Config::new();
     pg_config.host(&cfg.host);
     pg_config.port(cfg.port);
@@ -792,12 +832,64 @@ async fn connect_client(cfg: &ConnectionConfig) -> Result<(Client, String), Stri
     }
     pg_config.dbname(&cfg.database);
     pg_config.connect_timeout(std::time::Duration::from_secs(8));
+    pg_config
+}
 
-    let (client, connection) = pg_config
-        .connect(NoTls)
-        .await
-        .map_err(|e| format!("Failed to connect: {}", e))?;
+fn tls_connector(
+    cfg: &ConnectionConfig,
+) -> Result<tokio_postgres_rustls::MakeRustlsConnect, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    let native_certs = rustls_native_certs::load_native_certs();
+    let (added, ignored) = roots.add_parsable_certificates(native_certs.certs);
+    for error in &native_certs.errors {
+        eprintln!("TLS trust store warning: {error}");
+    }
+    if ignored > 0 {
+        eprintln!("TLS trust store warning: ignored {ignored} invalid native certificate(s)");
+    }
 
+    if !cfg.tls_root_cert.trim().is_empty() {
+        let file = std::fs::File::open(&cfg.tls_root_cert)
+            .map_err(|error| format!("Could not open TLS root certificate: {error}"))?;
+        let mut reader = BufReader::new(file);
+        let certificates = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Could not parse TLS root certificate: {error}"))?;
+        if certificates.is_empty() {
+            return Err("The TLS root certificate file contains no PEM certificates".to_string());
+        }
+        for certificate in certificates {
+            roots
+                .add(certificate)
+                .map_err(|error| format!("Invalid TLS root certificate: {error}"))?;
+        }
+    } else if added == 0 {
+        let details = native_certs
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "No trusted root certificates are available{}",
+            if details.is_empty() {
+                String::new()
+            } else {
+                format!(": {details}")
+            }
+        ));
+    }
+
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(client_config))
+}
+
+async fn finish_connection<C>(client: Client, connection: C) -> Result<(Client, String), String>
+where
+    C: Future<Output = Result<(), tokio_postgres::Error>> + Send + 'static,
+{
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("PostgreSQL connection error: {}", e);
@@ -1156,13 +1248,13 @@ pub fn role_sql_preview(form: &RoleForm) -> Result<String, String> {
     {
         return Err("Role memberships must have valid role names".to_string());
     }
-    let connection_limit = form
-        .connection_limit
-        .trim()
-        .parse::<i32>()
-        .map_err(|_| "Connection limit must be -1 (unlimited) or a non-negative integer".to_string())?;
+    let connection_limit = form.connection_limit.trim().parse::<i32>().map_err(|_| {
+        "Connection limit must be -1 (unlimited) or a non-negative integer".to_string()
+    })?;
     if connection_limit < -1 {
-        return Err("Connection limit must be -1 (unlimited) or a non-negative integer".to_string());
+        return Err(
+            "Connection limit must be -1 (unlimited) or a non-negative integer".to_string(),
+        );
     }
 
     let valid_until = form.valid_until.trim();
@@ -1179,12 +1271,36 @@ pub fn role_sql_preview(form: &RoleForm) -> Result<String, String> {
     let flags = format!(
         "{} {} {} {} {} {} {} CONNECTION LIMIT {} VALID UNTIL {}",
         if form.can_login { "LOGIN" } else { "NOLOGIN" },
-        if form.is_superuser { "SUPERUSER" } else { "NOSUPERUSER" },
-        if form.can_create_db { "CREATEDB" } else { "NOCREATEDB" },
-        if form.can_create_role { "CREATEROLE" } else { "NOCREATEROLE" },
-        if form.can_inherit { "INHERIT" } else { "NOINHERIT" },
-        if form.can_replicate { "REPLICATION" } else { "NOREPLICATION" },
-        if form.can_bypass_rls { "BYPASSRLS" } else { "NOBYPASSRLS" },
+        if form.is_superuser {
+            "SUPERUSER"
+        } else {
+            "NOSUPERUSER"
+        },
+        if form.can_create_db {
+            "CREATEDB"
+        } else {
+            "NOCREATEDB"
+        },
+        if form.can_create_role {
+            "CREATEROLE"
+        } else {
+            "NOCREATEROLE"
+        },
+        if form.can_inherit {
+            "INHERIT"
+        } else {
+            "NOINHERIT"
+        },
+        if form.can_replicate {
+            "REPLICATION"
+        } else {
+            "NOREPLICATION"
+        },
+        if form.can_bypass_rls {
+            "BYPASSRLS"
+        } else {
+            "NOBYPASSRLS"
+        },
         connection_limit,
         if valid_until.is_empty() {
             "'infinity'".to_string()

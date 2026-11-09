@@ -3,6 +3,7 @@ pub mod activity;
 pub mod config;
 pub mod db;
 pub mod models;
+pub mod profile_io;
 pub mod sql_ddl;
 pub mod ui;
 

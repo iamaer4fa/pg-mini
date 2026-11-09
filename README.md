@@ -49,6 +49,8 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
   - `🗑️ Drop Database...`: Drops the database with confirmation (protected against dropping active DB).
 - **Multiple Live Servers**: Connect to several PostgreSQL servers at once, switch the active server from the top bar, and keep each server connected while working with another.
 - **Profile Management**: Save and switch between multiple PostgreSQL connection profiles (Host, Port, Database, Username, Password).
+- **TLS Connections**: Disable TLS, prefer TLS with an explicit plaintext fallback, or require verified TLS. Verification uses the operating system trust store and optionally an additional PEM CA certificate.
+- **Portable Profiles**: Import and export connection profiles as versioned JSON. Passwords are excluded by default; enabling password export stores them as plaintext in the JSON file.
 - **Persistent Storage**: Saved connections and settings are automatically stored in `~/.config/pg-mini/config.json`.
 - **Show/Hide Password**: Quick toggle to verify database passwords.
 - **Connection Status Bar**: Displays current active database, host, port, and PostgreSQL server version.
@@ -175,7 +177,7 @@ Build a Debian package (including the desktop launcher and lightning icon):
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./target/debian/pg-mini_0.1.8_amd64.deb
+sudo apt install ./target/debian/pg-mini_0.1.9_amd64.deb
 ```
 
 The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop application launcher, and installs the icon in the hicolor icon theme.
@@ -186,11 +188,11 @@ To create a desktop shortcut manually, set `Exec` to the built executable and `I
 
 ## 🚀 Build Packages on GitHub
 
-The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.8`):
+The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.9`):
 
 ```bash
-git tag v0.1.8
-git push origin v0.1.8
+git tag v0.1.9
+git push origin v0.1.9
 ```
 
 Once all platform builds finish, GitHub publishes a Release with the Linux, Windows, and macOS downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.
@@ -202,6 +204,8 @@ To keep multiple PostgreSQL servers connected, choose **➕ Connect Server** and
 On macOS, download the matching `arm64` (Apple silicon) or `x64` (Intel) `.dmg` from the GitHub Release, open it, and drag **pg-mini** into **Applications**. The app is currently unsigned and not notarized, so macOS may require you to allow it in **System Settings → Privacy & Security** the first time it is opened.
 
 Backup and restore call the PostgreSQL client utilities (`pg_dump`, `pg_restore`, or `psql`) installed on your computer. Install PostgreSQL command-line tools separately and make sure their `bin` directory is on `PATH`. Backups are custom-format `.dump` files; restore also accepts PostgreSQL custom/tar archives and plain `.sql` files. Restore does not use `pg_restore --clean`, but SQL files and archive contents can still change or drop database objects.
+
+TLS mode **Prefer** attempts verified TLS first and falls back to plaintext if TLS negotiation fails; it does not retry in plaintext after the server returns a PostgreSQL error. Choose **Require** to prevent plaintext fallback. Both TLS modes validate the server certificate and hostname using the operating system trust store, augmented by the optional PEM CA certificate. Imported certificate paths are local paths and may need to be updated on the destination computer. Profile JSON exports omit passwords by default; password-inclusive exports contain credentials in plaintext and should be protected accordingly.
 
 The Activity dashboard is refreshed from PostgreSQL's statistics views and shows data visible to the connected database role; PostgreSQL may hide query text or other session details from non-privileged accounts.
 

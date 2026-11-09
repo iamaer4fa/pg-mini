@@ -1,11 +1,21 @@
+use crate::models::{AppConfig, ConnectionConfig, TlsMode};
 use egui::{Color32, RichText, Window};
-use crate::models::{AppConfig, ConnectionConfig};
+
+pub enum ConnectionModalAction {
+    Connect {
+        config: ConnectionConfig,
+        save_error: Option<String>,
+    },
+    ImportProfiles,
+    ExportProfiles { include_passwords: bool },
+}
 
 pub struct ConnectionModal {
     pub is_open: bool,
     pub current_cfg: ConnectionConfig,
     pub show_password: bool,
     pub error_message: Option<String>,
+    pub include_passwords_in_export: bool,
 }
 
 impl ConnectionModal {
@@ -15,6 +25,7 @@ impl ConnectionModal {
             current_cfg: initial_cfg,
             show_password: false,
             error_message: None,
+            include_passwords_in_export: false,
         }
     }
 
@@ -24,8 +35,8 @@ impl ConnectionModal {
         config: &mut AppConfig,
         is_connected: bool,
         is_busy: bool,
-    ) -> Option<ConnectionConfig> {
-        let mut connect_to: Option<ConnectionConfig> = None;
+    ) -> Option<ConnectionModalAction> {
+        let mut action = None;
         if !self.is_open {
             return None;
         }
@@ -60,14 +71,21 @@ impl ConnectionModal {
                         .selected_text(&self.current_cfg.name)
                         .show_ui(ui, |ui| {
                             for p in &config.saved_connections {
-                                if ui.selectable_value(&mut selected_id, p.id.clone(), &p.name).clicked() {
+                                if ui
+                                    .selectable_value(&mut selected_id, p.id.clone(), &p.name)
+                                    .clicked()
+                                {
                                     self.current_cfg = p.clone();
                                     self.error_message = None;
                                 }
                             }
                         });
 
-                    if ui.button("➕ New").on_hover_text("Create a new connection profile").clicked() {
+                    if ui
+                        .button("➕ New")
+                        .on_hover_text("Create a new connection profile")
+                        .clicked()
+                    {
                         let mut new_cfg = ConnectionConfig::default();
                         new_cfg.name = format!("Connection {}", config.saved_connections.len() + 1);
                         config.saved_connections.push(new_cfg.clone());
@@ -75,8 +93,15 @@ impl ConnectionModal {
                         self.error_message = None;
                     }
 
-                    if config.saved_connections.len() > 1 && ui.button("🗑 Delete").on_hover_text("Delete current profile").clicked() {
-                        config.saved_connections.retain(|p| p.id != self.current_cfg.id);
+                    if config.saved_connections.len() > 1
+                        && ui
+                            .button("🗑 Delete")
+                            .on_hover_text("Delete current profile")
+                            .clicked()
+                    {
+                        config
+                            .saved_connections
+                            .retain(|p| p.id != self.current_cfg.id);
                         if let Some(first) = config.saved_connections.first() {
                             self.current_cfg = first.clone();
                         }
@@ -118,14 +143,86 @@ impl ConnectionModal {
                             if self.show_password {
                                 ui.text_edit_singleline(&mut self.current_cfg.password);
                             } else {
-                                ui.add(egui::TextEdit::singleline(&mut self.current_cfg.password).password(true));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.current_cfg.password)
+                                        .password(true),
+                                );
                             }
-                            if ui.button(if self.show_password { "👁 Hide" } else { "👁 Show" }).clicked() {
+                            if ui
+                                .button(if self.show_password {
+                                    "👁 Hide"
+                                } else {
+                                    "👁 Show"
+                                })
+                                .clicked()
+                            {
                                 self.show_password = !self.show_password;
                             }
                         });
                         ui.end_row();
+
+                        ui.label("TLS:");
+                        egui::ComboBox::from_id_salt("connection_tls_mode")
+                            .selected_text(self.current_cfg.tls_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in [TlsMode::Disable, TlsMode::Prefer, TlsMode::Require] {
+                                    ui.selectable_value(
+                                        &mut self.current_cfg.tls_mode,
+                                        mode,
+                                        mode.label(),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        if self.current_cfg.tls_mode != TlsMode::Disable {
+                            ui.label("Additional CA certificate:");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.current_cfg.tls_root_cert)
+                                        .hint_text("Optional PEM file"),
+                                );
+                                if ui.button("Browse...").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("PEM certificate", &["pem", "crt", "cer"])
+                                        .pick_file()
+                                    {
+                                        self.current_cfg.tls_root_cert =
+                                            path.to_string_lossy().into_owned();
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
                     });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Import Profiles...").clicked() {
+                        action = Some(ConnectionModalAction::ImportProfiles);
+                    }
+                    if ui.button("Export Profiles...").clicked() {
+                        if let Some(pos) = config
+                            .saved_connections
+                            .iter()
+                            .position(|profile| profile.id == self.current_cfg.id)
+                        {
+                            config.saved_connections[pos] = self.current_cfg.clone();
+                        } else {
+                            config.saved_connections.push(self.current_cfg.clone());
+                        }
+                        self.error_message = crate::config::ConfigManager::save(config)
+                            .err()
+                            .map(|error| format!("Could not save profile: {error}"));
+                        action = Some(ConnectionModalAction::ExportProfiles {
+                            include_passwords: self.include_passwords_in_export,
+                        });
+                    }
+                    ui.checkbox(
+                        &mut self.include_passwords_in_export,
+                        "Include passwords (plaintext)",
+                    );
+                });
 
                 if let Some(err) = &self.error_message {
                     ui.add_space(10.0);
@@ -136,9 +233,17 @@ impl ConnectionModal {
                         .rounding(4.0)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("⚠ Connection Error:").color(Color32::LIGHT_RED).strong());
+                                ui.label(
+                                    RichText::new("⚠ Connection/Profile Error:")
+                                        .color(Color32::LIGHT_RED)
+                                        .strong(),
+                                );
                             });
-                            ui.label(RichText::new(err).color(Color32::from_rgb(255, 180, 180)).monospace());
+                            ui.label(
+                                RichText::new(err)
+                                    .color(Color32::from_rgb(255, 180, 180))
+                                    .monospace(),
+                            );
                         });
                 }
 
@@ -148,33 +253,54 @@ impl ConnectionModal {
 
                 ui.horizontal(|ui| {
                     if ui.button("💾 Save Profile").clicked() {
-                        if let Some(pos) = config.saved_connections.iter().position(|p| p.id == self.current_cfg.id) {
+                        if let Some(pos) = config
+                            .saved_connections
+                            .iter()
+                            .position(|p| p.id == self.current_cfg.id)
+                        {
                             config.saved_connections[pos] = self.current_cfg.clone();
                         } else {
                             config.saved_connections.push(self.current_cfg.clone());
                         }
-                        crate::config::ConfigManager::save(config);
+                        self.error_message = crate::config::ConfigManager::save(config)
+                            .err()
+                            .map(|error| format!("Could not save profile: {error}"));
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let connect_btn = ui.add_enabled(
                             !is_busy,
-                            egui::Button::new(RichText::new(if is_busy { "⏳ Connecting..." } else { "🔌 Connect" }).strong())
-                                .fill(Color32::from_rgb(16, 145, 90)),
+                            egui::Button::new(
+                                RichText::new(if is_busy {
+                                    "⏳ Connecting..."
+                                } else {
+                                    "🔌 Connect"
+                                })
+                                .strong(),
+                            )
+                            .fill(Color32::from_rgb(16, 145, 90)),
                         );
 
                         if connect_btn.clicked() {
                             // Update saved profiles
-                            if let Some(pos) = config.saved_connections.iter().position(|p| p.id == self.current_cfg.id) {
+                            if let Some(pos) = config
+                                .saved_connections
+                                .iter()
+                                .position(|p| p.id == self.current_cfg.id)
+                            {
                                 config.saved_connections[pos] = self.current_cfg.clone();
                             } else {
                                 config.saved_connections.push(self.current_cfg.clone());
                             }
                             config.last_connection_id = Some(self.current_cfg.id.clone());
-                            crate::config::ConfigManager::save(config);
-
-                            self.error_message = None;
-                            connect_to = Some(self.current_cfg.clone());
+                            let save_error = crate::config::ConfigManager::save(config)
+                                .err()
+                                .map(|error| format!("Could not save profile: {error}"));
+                            self.error_message = save_error.clone();
+                            action = Some(ConnectionModalAction::Connect {
+                                config: self.current_cfg.clone(),
+                                save_error,
+                            });
                         }
 
                         if is_connected && ui.button("Cancel").clicked() {
@@ -184,6 +310,6 @@ impl ConnectionModal {
                 });
             });
 
-        connect_to
+        action
     }
 }

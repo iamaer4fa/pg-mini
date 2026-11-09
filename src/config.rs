@@ -22,14 +22,15 @@ impl ConfigManager {
         AppConfig::default()
     }
 
-    pub fn save(config: &AppConfig) {
-        if let Some(path) = Self::config_path() {
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            if let Ok(json) = serde_json::to_string_pretty(config) {
-                let _ = fs::write(path, json);
-            }
+    pub fn save(config: &AppConfig) -> Result<(), String> {
+        let path = Self::config_path()
+            .ok_or_else(|| "Could not locate the application config directory".to_string())?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("Could not create config directory: {error}"))?;
         }
+        let json = serde_json::to_string_pretty(config)
+            .map_err(|error| format!("Could not encode application config: {error}"))?;
+        fs::write(path, json).map_err(|error| format!("Could not save application config: {error}"))
     }
 }

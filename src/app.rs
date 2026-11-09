@@ -8,13 +8,11 @@ use crate::models::{
     AppConfig, CellValue, ColumnItem, ConfirmAction, ConfirmDialogState, DatabaseItem,
     DbObjectKind, DbObjectRef, EditableCell, QueryResult, RoleItem, TableItem,
 };
-use crate::ui::columns_view::{ColumnsViewAction, render_columns_view};
 use crate::ui::activity_view::render_activity_view;
-use crate::ui::connection_modal::ConnectionModal;
+use crate::ui::columns_view::{ColumnsViewAction, render_columns_view};
+use crate::ui::connection_modal::{ConnectionModal, ConnectionModalAction};
 use crate::ui::data_table::{DataTableAction, DataTableState, export_to_csv, render_data_table};
-use crate::ui::dialogs::{
-    AddColumnModal, CreateTableModal, ObjectDdlModal, render_confirm_dialog,
-};
+use crate::ui::dialogs::{AddColumnModal, CreateTableModal, ObjectDdlModal, render_confirm_dialog};
 use crate::ui::roles::{RolesAction, RolesViewState};
 use crate::ui::sidebar::{Sidebar, SidebarAction};
 use crate::ui::sql_editor::{SqlEditor, SqlEditorAction};
@@ -644,7 +642,9 @@ impl eframe::App for PgMiniApp {
                     if ui.button(theme_icon).clicked() {
                         self.config.dark_mode = !self.config.dark_mode;
                         setup_custom_theme(ctx, self.config.dark_mode);
-                        ConfigManager::save(&self.config);
+                        if let Err(error) = ConfigManager::save(&self.config) {
+                            self.show_toast(&error, true);
+                        }
                     }
                 });
             });
@@ -683,7 +683,7 @@ impl eframe::App for PgMiniApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("v0.1.8").size(11.0).color(Color32::DARK_GRAY));
+                    ui.label(RichText::new("v0.1.9").size(11.0).color(Color32::DARK_GRAY));
                 });
             });
         });
@@ -1079,7 +1079,9 @@ impl eframe::App for PgMiniApp {
                     }
                     if self.sql_editor.history != previous_history {
                         self.config.query_history = self.sql_editor.history.clone();
-                        ConfigManager::save(&self.config);
+                        if let Err(error) = ConfigManager::save(&self.config) {
+                            self.show_toast(&error, true);
+                        }
                     }
                 }
                 ActiveTab::SchemaView => {
@@ -1153,13 +1155,77 @@ impl eframe::App for PgMiniApp {
         });
 
         // Modals
-        if let Some(cfg) = self.connection_modal.show(
+        if let Some(action) = self.connection_modal.show(
             ctx,
             &mut self.config,
             self.is_connected || !self.connected_servers.is_empty(),
             self.is_busy,
         ) {
-            self.connect_to_server(cfg);
+            match action {
+                ConnectionModalAction::Connect { config, save_error } => {
+                    if let Some(error) = save_error {
+                        self.show_toast(&error, true);
+                    }
+                    self.connect_to_server(config);
+                }
+                ConnectionModalAction::ImportProfiles => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("JSON profile file", &["json"])
+                        .pick_file()
+                    {
+                        match std::fs::read_to_string(&path)
+                            .map_err(|error| format!("Could not read profile file: {error}"))
+                            .and_then(|json| crate::profile_io::import_profiles(&json))
+                        {
+                            Ok(profiles) => {
+                                let imported_count = profiles.len();
+                                if let Some(profile) = profiles.first() {
+                                    self.connection_modal.current_cfg = profile.clone();
+                                }
+                                self.config.saved_connections.extend(profiles);
+                                match ConfigManager::save(&self.config) {
+                                    Ok(()) => self.show_toast(
+                                        &format!(
+                                            "Imported {imported_count} connection profile(s)"
+                                        ),
+                                        false,
+                                    ),
+                                    Err(error) => self.show_toast(
+                                        &format!(
+                                            "Imported {imported_count} profile(s) for this session, but could not save config: {error}"
+                                        ),
+                                        true,
+                                    ),
+                                }
+                            }
+                            Err(error) => self.show_toast(&error, true),
+                        }
+                    }
+                }
+                ConnectionModalAction::ExportProfiles { include_passwords } => {
+                    match crate::profile_io::export_profiles(
+                        &self.config.saved_connections,
+                        include_passwords,
+                    ) {
+                        Ok(json) => {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .set_file_name("pg-mini-profiles.json")
+                                .add_filter("JSON profile file", &["json"])
+                                .save_file()
+                            {
+                                match std::fs::write(path, json) {
+                                    Ok(()) => self.show_toast("Profiles exported", false),
+                                    Err(error) => self.show_toast(
+                                        &format!("Could not write profile file: {error}"),
+                                        true,
+                                    ),
+                                }
+                            }
+                        }
+                        Err(error) => self.show_toast(&error, true),
+                    }
+                }
+            }
         }
 
         if let Some(form) = self.add_column_modal.show(ctx, self.is_busy) {
@@ -1275,7 +1341,7 @@ impl eframe::App for PgMiniApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.set_min_width(340.0);
-                    ui.heading("⚡ pg-mini v0.1.8");
+                    ui.heading("⚡ pg-mini v0.1.9");
                     ui.label("Ultra-lightweight native PostgreSQL manager.");
                     ui.add_space(8.0);
                     ui.label("Built with Rust + egui/eframe + tokio-postgres.");

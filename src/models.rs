@@ -1,5 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsMode {
+    #[default]
+    Disable,
+    Prefer,
+    Require,
+}
+
+impl TlsMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disable => "Disable",
+            Self::Prefer => "Prefer TLS (allow plaintext fallback)",
+            Self::Require => "Require verified TLS",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConnectionConfig {
     pub id: String,
@@ -10,6 +29,10 @@ pub struct ConnectionConfig {
     pub username: String,
     #[serde(default)]
     pub password: String,
+    #[serde(default)]
+    pub tls_mode: TlsMode,
+    #[serde(default)]
+    pub tls_root_cert: String,
 }
 
 impl Default for ConnectionConfig {
@@ -22,6 +45,8 @@ impl Default for ConnectionConfig {
             database: "postgres".to_string(),
             username: "postgres".to_string(),
             password: String::new(),
+            tls_mode: TlsMode::Disable,
+            tls_root_cert: String::new(),
         }
     }
 }
