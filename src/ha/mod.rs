@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
+pub mod provisioning;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRole {
     Primary,
