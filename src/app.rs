@@ -1,10 +1,11 @@
 use egui::{CentralPanel, Color32, RichText, SidePanel, TopBottomPanel};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::activity::ActivitySnapshot;
 use crate::config::ConfigManager;
 use crate::db::{DbRequest, DbResponse, DbWorker};
+use crate::ha::provisioning::HaProvisioningWizard;
 use crate::ha::{HaEventSeverity, HaNode, HaNodeStatus, HaStatusChange, ReplicationStatus};
 use crate::models::{
     AppConfig, CellValue, ColumnItem, ConfirmAction, ConfirmDialogState, DatabaseItem,
@@ -17,6 +18,7 @@ use crate::ui::connection_modal::{ConnectionModal, ConnectionModalAction};
 use crate::ui::data_table::{DataTableAction, DataTableState, export_to_csv, render_data_table};
 use crate::ui::dialogs::{AddColumnModal, CreateTableModal, ObjectDdlModal, render_confirm_dialog};
 use crate::ui::ha_overview::render_ha_overview;
+use crate::ui::ha_provisioning::render_ha_provisioning;
 use crate::ui::roles::{RolesAction, RolesViewState};
 use crate::ui::sidebar::{Sidebar, SidebarAction};
 use crate::ui::sql_editor::{SqlEditor, SqlEditorAction};
@@ -97,6 +99,7 @@ pub struct PgMiniApp {
     ha_selected_connection: Option<String>,
     ha_events: VecDeque<HaStatusChange>,
     ha_node_cache: HashMap<String, HaNodeSnapshot>,
+    ha_provisioning: HaProvisioningWizard,
     sql_editor: SqlEditor,
     last_query_result: Option<Result<QueryResult, String>>,
 
@@ -171,6 +174,7 @@ impl PgMiniApp {
             ha_selected_connection: None,
             ha_events: VecDeque::new(),
             ha_node_cache: HashMap::new(),
+            ha_provisioning: HaProvisioningWizard::default(),
             sql_editor,
             last_query_result: None,
             add_column_modal: AddColumnModal::default(),
@@ -201,6 +205,45 @@ impl PgMiniApp {
 
     fn request_system_stats_refresh(&mut self) {
         self.db_worker.send(DbRequest::FetchSystemStats);
+    }
+
+    fn connected_connection_ids(&self) -> HashSet<String> {
+        let mut ids = self
+            .connected_servers
+            .iter()
+            .map(|server| server.config.id.clone())
+            .collect::<HashSet<_>>();
+        if self.is_connected {
+            if let Some(connection) = &self.active_connection {
+                ids.insert(connection.id.clone());
+            }
+        }
+        ids
+    }
+
+    fn request_provisioning_preflight(&mut self, connection_ids: Vec<String>) {
+        for connection_id in connection_ids {
+            self.ha_provisioning.begin_preflight(connection_id.clone());
+            if self.is_connected
+                && self
+                    .active_connection
+                    .as_ref()
+                    .is_some_and(|connection| connection.id == connection_id)
+            {
+                self.db_worker.send(DbRequest::FetchProvisioningPreflight);
+            } else if let Some(server) = self
+                .connected_servers
+                .iter_mut()
+                .find(|server| server.config.id == connection_id)
+            {
+                server.worker.send(DbRequest::FetchProvisioningPreflight);
+            } else {
+                self.ha_provisioning.finish_preflight(
+                    connection_id,
+                    Err("The selected saved connection is no longer connected.".to_string()),
+                );
+            }
+        }
     }
 
     fn request_ha_refresh(&mut self) {
@@ -485,6 +528,10 @@ impl PgMiniApp {
                     DbResponse::Busy(is_busy) => server.is_busy = is_busy,
                     DbResponse::Disconnected => {
                         disconnected_server_ids.push(server.config.id.clone());
+                        self.ha_provisioning.finish_preflight(
+                            server.config.id.clone(),
+                            Err("The connection was lost during preflight.".to_string()),
+                        );
                         if let Some(snapshot) = self.ha_node_cache.get_mut(&server.config.id) {
                             snapshot.is_connected = false;
                         }
@@ -496,6 +543,10 @@ impl PgMiniApp {
                     DbResponse::ConnectionFailed(error) | DbResponse::OperationFailed(error) => {
                         errors.push(format!("{}: {}", server.config.name, error));
                     }
+                    DbResponse::ProvisioningPreflightFetched {
+                        connection_id,
+                        result,
+                    } => self.ha_provisioning.finish_preflight(connection_id, result),
                     DbResponse::HaStatusFetched(result) => {
                         server.ha_status_pending = false;
                         match result {
@@ -659,6 +710,12 @@ impl PgMiniApp {
                 }
                 DbResponse::Disconnected => {
                     if let Some(connection) = &self.active_connection {
+                        self.ha_provisioning.finish_preflight(
+                            connection.id.clone(),
+                            Err("The connection was lost during preflight.".to_string()),
+                        );
+                    }
+                    if let Some(connection) = &self.active_connection {
                         if let Some(snapshot) = self.ha_node_cache.get_mut(&connection.id) {
                             snapshot.is_connected = false;
                         }
@@ -705,6 +762,12 @@ impl PgMiniApp {
                     }
                     Err(error) => self.show_toast(error, true),
                 },
+                DbResponse::ProvisioningPreflightFetched {
+                    connection_id,
+                    result,
+                } => {
+                    self.ha_provisioning.finish_preflight(connection_id, result);
+                }
                 DbResponse::SchemasFetched { database, result } => {
                     if database == self.current_db {
                         if let Err(error) = &result {
@@ -1641,29 +1704,48 @@ impl eframe::App for PgMiniApp {
                     }
                 }
                 ActiveTab::HaOverview => {
-                    let nodes = self.ha_nodes();
-                    let (refresh, config_changed) = render_ha_overview(
-                        ui,
-                        &mut self.config.ha_clusters,
-                        &self.config.saved_connections,
-                        &nodes,
-                        self.is_busy,
-                        &mut self.config.ha_monitoring,
-                        &self.ha_events,
-                        &mut self.ha_new_cluster_name,
-                        &mut self.ha_selected_connection,
-                    );
-                    if refresh {
-                        self.request_ha_refresh();
-                    }
-                    if config_changed {
-                        match ConfigManager::save(&self.config) {
-                            Ok(()) => self.show_toast("HA cluster configuration saved", false),
-                            Err(error) => self.show_toast(error, true),
-                        }
-                        self.ha_last_requested = None;
-                        self.request_ha_refresh();
-                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("ha_overview_content")
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            let nodes = self.ha_nodes();
+                            let (refresh, config_changed) = render_ha_overview(
+                                ui,
+                                &mut self.config.ha_clusters,
+                                &self.config.saved_connections,
+                                &nodes,
+                                self.is_busy,
+                                &mut self.config.ha_monitoring,
+                                &self.ha_events,
+                                &mut self.ha_new_cluster_name,
+                                &mut self.ha_selected_connection,
+                            );
+                            if refresh {
+                                self.request_ha_refresh();
+                            }
+                            if config_changed {
+                                match ConfigManager::save(&self.config) {
+                                    Ok(()) => {
+                                        self.show_toast("HA cluster configuration saved", false)
+                                    }
+                                    Err(error) => self.show_toast(error, true),
+                                }
+                                self.ha_last_requested = None;
+                                self.request_ha_refresh();
+                            }
+                            let connected_ids = self.connected_connection_ids();
+                            let provisioning_busy = self.is_busy
+                                || self.connected_servers.iter().any(|server| server.is_busy);
+                            if let Some(connection_ids) = render_ha_provisioning(
+                                ui,
+                                &mut self.ha_provisioning,
+                                &self.config.saved_connections,
+                                &connected_ids,
+                                provisioning_busy,
+                            ) {
+                                self.request_provisioning_preflight(connection_ids);
+                            }
+                        });
                 }
             }
         });

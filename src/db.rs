@@ -9,6 +9,7 @@ use std::{
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 use crate::activity::{ActivityLock, ActivitySession, ActivitySnapshot, SizeEntry};
+use crate::ha::provisioning::ProvisioningPreflight;
 use crate::ha::{
     HaNodeStatus, NodeRole, PrimaryStandbyStatus, ReplicationStatus, WalReceiverStatus,
 };
@@ -17,7 +18,7 @@ use crate::models::{
     DbObjectItem, DbObjectKind, DbObjectRef, EditableCell, ObjectTreeKey, QueryResult, RoleForm,
     RoleItem, TableItem, TlsMode,
 };
-use crate::system_stats::{SystemStatsSection, SystemStatsSnapshot, SYSTEM_STATS_FUNCTIONS};
+use crate::system_stats::{SYSTEM_STATS_FUNCTIONS, SystemStatsSection, SystemStatsSnapshot};
 
 #[derive(Debug)]
 pub enum DbRequest {
@@ -27,6 +28,7 @@ pub enum DbRequest {
     FetchRoles,
     FetchActivity,
     FetchSystemStats,
+    FetchProvisioningPreflight,
     FetchHaStatus,
     SaveRole(RoleForm),
     DropRole(String),
@@ -127,6 +129,10 @@ pub enum DbResponse {
     RolesFetched(Result<Vec<RoleItem>, String>),
     ActivityFetched(Result<ActivitySnapshot, String>),
     SystemStatsFetched(Result<SystemStatsSnapshot, String>),
+    ProvisioningPreflightFetched {
+        connection_id: String,
+        result: Result<ProvisioningPreflight, String>,
+    },
     HaStatusFetched(Result<HaNodeStatus, String>),
     SchemasFetched {
         database: String,
@@ -238,6 +244,21 @@ impl DbWorker {
                                     let _ = res_tx.send(DbResponse::Busy(true));
                                     let result = fetch_system_stats_impl(client).await;
                                     let _ = res_tx.send(DbResponse::SystemStatsFetched(result));
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::FetchProvisioningPreflight => {
+                                if let (Some(client), Some(config)) =
+                                    (&current_client, &current_cfg)
+                                {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    let result = fetch_provisioning_preflight_impl(client).await;
+                                    let _ = res_tx.send(
+                                        DbResponse::ProvisioningPreflightFetched {
+                                            connection_id: config.id.clone(),
+                                            result,
+                                        },
+                                    );
                                     let _ = res_tx.send(DbResponse::Busy(false));
                                 }
                             }
@@ -808,6 +829,112 @@ impl DbWorker {
     }
 }
 
+async fn fetch_provisioning_preflight_impl(
+    client: &Client,
+) -> Result<ProvisioningPreflight, String> {
+    let rows = client
+        .simple_query(
+            "SELECT current_setting('server_version_num'), \
+             current_setting('server_version'), \
+             pg_catalog.pg_is_in_recovery()::text, \
+             current_setting('wal_level'), \
+             current_setting('max_wal_senders'), \
+             current_setting('max_replication_slots'), \
+             current_setting('listen_addresses'), \
+             current_setting('ssl'), \
+             role.rolsuper::text, role.rolcreaterole::text, role.rolreplication::text \
+             FROM pg_catalog.pg_roles AS role \
+             WHERE role.rolname = current_user;",
+        )
+        .await
+        .map_err(|error| {
+            format!("Failed to inspect PostgreSQL provisioning prerequisites: {error}")
+        })?;
+    let row = rows
+        .into_iter()
+        .find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            "Could not read the connected PostgreSQL role and server settings.".to_string()
+        })?;
+
+    let server_version_num = parse_preflight_i32(&row, 0, "server_version_num")?;
+    let (system_identifier, system_identifier_error) = if server_version_num >= 100000 {
+        client
+            .query_one(
+                "SELECT system_identifier::text FROM pg_catalog.pg_control_system()",
+                &[],
+            )
+            .await
+            .and_then(|row| row.try_get::<_, String>(0).map_err(Into::into))
+            .map(|identifier| (Some(identifier), None))
+            .unwrap_or_else(|error| {
+                (
+                    None,
+                    Some(format!(
+                        "System identifier is unavailable to this account: {error}"
+                    )),
+                )
+            })
+    } else {
+        (
+            None,
+            Some("System identifier requires PostgreSQL 10 or later.".to_string()),
+        )
+    };
+    Ok(ProvisioningPreflight {
+        server_version_num,
+        server_version: preflight_value(&row, 1, "server_version")?,
+        is_in_recovery: parse_preflight_bool(&row, 2, "recovery state")?,
+        system_identifier,
+        system_identifier_error,
+        wal_level: preflight_value(&row, 3, "wal_level")?,
+        max_wal_senders: parse_preflight_i32(&row, 4, "max_wal_senders")?,
+        max_replication_slots: parse_preflight_i32(&row, 5, "max_replication_slots")?,
+        listen_addresses: preflight_value(&row, 6, "listen_addresses")?,
+        ssl_enabled: parse_preflight_bool(&row, 7, "SSL setting")?,
+        is_superuser: parse_preflight_bool(&row, 8, "superuser privilege")?,
+        can_create_role: parse_preflight_bool(&row, 9, "CREATEROLE privilege")?,
+        can_replication: parse_preflight_bool(&row, 10, "REPLICATION privilege")?,
+    })
+}
+
+fn preflight_value(
+    row: &tokio_postgres::SimpleQueryRow,
+    index: usize,
+    label: &str,
+) -> Result<String, String> {
+    row.get(index)
+        .map(str::to_string)
+        .ok_or_else(|| format!("PostgreSQL preflight returned no {label} value."))
+}
+
+fn parse_preflight_i32(
+    row: &tokio_postgres::SimpleQueryRow,
+    index: usize,
+    label: &str,
+) -> Result<i32, String> {
+    preflight_value(row, index, label)?
+        .parse::<i32>()
+        .map_err(|_| format!("PostgreSQL preflight returned an invalid {label} value."))
+}
+
+fn parse_preflight_bool(
+    row: &tokio_postgres::SimpleQueryRow,
+    index: usize,
+    label: &str,
+) -> Result<bool, String> {
+    match preflight_value(row, index, label)?.as_str() {
+        "true" | "t" | "on" | "1" => Ok(true),
+        "false" | "f" | "off" | "0" => Ok(false),
+        _ => Err(format!(
+            "PostgreSQL preflight returned an invalid {label} value."
+        )),
+    }
+}
+
 async fn fetch_ha_status_impl(client: &Client) -> Result<HaNodeStatus, String> {
     let server_version_num: i32 = client
         .query_one("SELECT current_setting('server_version_num')::integer", &[])
@@ -1259,10 +1386,12 @@ async fn fetch_system_stats_impl(client: &Client) -> Result<SystemStatsSnapshot,
         .await
         .map_err(|error| format!("Failed to check for system_stats extension: {error}"))?;
 
-    let extension_schema = extension_rows.into_iter().find_map(|message| match message {
-        SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
-        _ => None,
-    });
+    let extension_schema = extension_rows
+        .into_iter()
+        .find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+            _ => None,
+        });
     let Some(extension_schema) = extension_schema else {
         return Ok(SystemStatsSnapshot {
             extension_schema: None,
