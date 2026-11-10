@@ -171,7 +171,9 @@ The compiled binary will be placed at `target/release/pg-mini`.
 
 ---
 
-## 📦 Build and Install the Ubuntu Package
+## 📦 Build and Install Linux Packages
+
+### Ubuntu / Debian
 
 Build a Debian package (including the desktop launcher and lightning icon):
 
@@ -184,11 +186,29 @@ The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop 
 
 To create a desktop shortcut manually, set `Exec` to the built executable and `Icon` to the absolute path of `packaging/pg-mini.svg` in your local checkout.
 
+### RHEL-compatible distributions
+
+RPM packages are built on Rocky Linux 9 for x86_64 and target RHEL 9-compatible distributions, including Rocky Linux 9, AlmaLinux 9, RHEL 9, and CentOS Stream 9. CentOS Linux 7/8 and other older releases are not supported. The package requires the system GUI libraries listed in its RPM metadata.
+
+On a supported distribution, install the downloaded package with:
+
+```bash
+sudo dnf install ./pg-mini-0.1.10-1.el9.x86_64.rpm
+```
+
+To build the RPM locally on a Rocky Linux 9-compatible build environment, install Rust, the Linux GUI development libraries, and `rpm-build`, then run:
+
+```bash
+./packaging/build-rpm.sh
+```
+
+The generated RPM is placed in `target/rpm/`.
+
 ---
 
 ## 🚀 Build Packages on GitHub
 
-The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.10`):
+The GitHub Actions workflow builds the Ubuntu `.deb`, a RHEL-compatible `.rpm`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.10`):
 
 ```bash
 git tag v0.1.10

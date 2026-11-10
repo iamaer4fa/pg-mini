@@ -44,8 +44,58 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pg-mini-linux-amd64
+          name: pg-mini-ubuntu-amd64
           path: target/debian/*.deb
+          if-no-files-found: error
+
+  build-rpm:
+    name: Build RHEL-compatible RPM
+    runs-on: ubuntu-24.04
+    container: rockylinux:9
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install --assumeyes \
+            curl \
+            gcc \
+            gcc-c++ \
+            git \
+            gzip \
+            libX11-devel \
+            libX11-xcb-devel \
+            libXcursor-devel \
+            libXi-devel \
+            libXrandr-devel \
+            libxcb-devel \
+            libxkbcommon-devel \
+            make \
+            mesa-libGL-devel \
+            pkgconf-pkg-config \
+            rpm-build \
+            tar \
+            wayland-devel
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rocky-9-rpm
+
+      - name: Verify release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          test "$GITHUB_REF_NAME" = "v$version"
+
+      - name: Build RPM package
+        run: ./packaging/build-rpm.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pg-mini-rhel-compatible-x86_64
+          path: target/rpm/*.rpm
           if-no-files-found: error
 
   build-windows:
@@ -152,6 +202,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs:
       - build-linux
+      - build-rpm
       - build-windows
       - build-macos
     runs-on: ubuntu-latest
