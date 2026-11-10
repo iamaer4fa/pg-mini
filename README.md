@@ -107,7 +107,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 - **Schema DDL Forms**: Create indexes, foreign keys, CHECK/UNIQUE/PRIMARY KEY constraints, views, and sequences from object-browser context menus; inspect generated SQL previews before execution.
 - **Table Grants**: Grant or revoke table privileges for existing roles or `PUBLIC`, including grant option and revoke cascade controls, with a generated SQL preview.
 - **Activity Dashboard**: Monitor visible sessions, queries running at least five seconds, blocked sessions and lock waits, and the largest databases and tables. Refresh manually or automatically every 15 seconds while the dashboard is open.
-- **HA Overview**: Detect whether each connected PostgreSQL server is a primary or standby, refresh roles automatically while the overview is open, and show active and other connected servers together. This initial foundation does not yet verify cluster membership or replication health.
+- **HA Overview**: Group saved connection profiles into named clusters, monitor each node's role, connection state, and last update, and view PostgreSQL streaming-replication state. Primary-to-standby links are confirmed only when receiver metadata matches a configured primary; PostgreSQL system identifiers are compared when available. Missing or ambiguous evidence is shown as unverified, never inferred from hostnames alone. pg-mini does not configure replication.
 - **Persistent Query History**: Keeps the latest 200 distinct queries in the app configuration, with search, load-into-editor, and copy actions.
 - **Error Reporting**: Clear, highlighted PostgreSQL error banners when syntax or constraints fail.
 
@@ -248,7 +248,7 @@ postgresql-manager/
 - **PostgreSQL Client**: [`tokio-postgres`](https://docs.rs/tokio-postgres) (pure asynchronous wire-protocol implementation in Rust, without external C `libpq` dependencies).
 - **Concurrency**: Messages between the GUI and the database worker are exchanged asynchronously over standard channels, ensuring zero UI freezes during query execution.
 - **Object Catalogs**: The browser queries PostgreSQL `pg_catalog`; each expanded object group is loaded asynchronously through the existing database worker.
-- **HA Role Detection**: The HA overview uses PostgreSQL's `pg_is_in_recovery()` on each connected server to distinguish a standby from a primary. It does not yet establish that servers form a cluster or inspect replication health.
+- **HA Monitoring**: The overview uses `pg_is_in_recovery()`, `pg_stat_replication`, `pg_stat_wal_receiver`, and (when permitted) `pg_control_system()` metadata. Cluster associations are stored in the local app configuration. A standby's reported sender endpoint is matched against configured primary endpoints, and system identifiers are compared where available; unavailable or conflicting evidence is reported rather than silently treated as a confirmed relationship. Replication configuration and failover are not managed by pg-mini.
 - **Configuration**: JSON-serialized settings stored in standard XDG config directories via `dirs`.
 
 ---
