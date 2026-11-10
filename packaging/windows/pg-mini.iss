@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.12"
+  #define MyAppVersion "0.1.13"
 #endif
 
 #define MyAppName "pg-mini"

@@ -4,6 +4,7 @@ pub mod connection_modal;
 pub mod data_table;
 pub mod dialogs;
 pub mod ha_overview;
+pub mod ha_provisioning;
 pub mod roles;
 pub mod sidebar;
 pub mod sql_editor;

@@ -180,7 +180,7 @@ Build a Debian package (including the desktop launcher and lightning icon):
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./target/debian/pg-mini_0.1.12_amd64.deb
+sudo apt install ./target/debian/pg-mini_0.1.13_amd64.deb
 ```
 
 The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop application launcher, and installs the icon in the hicolor icon theme.
@@ -194,7 +194,7 @@ RPM packages are built on Rocky Linux 9 for x86_64 and target RHEL 9-compatible 
 On a supported distribution, install the downloaded package with:
 
 ```bash
-sudo dnf install ./pg-mini-0.1.12-1.el9.x86_64.rpm
+sudo dnf install ./pg-mini-0.1.13-1.el9.x86_64.rpm
 ```
 
 To build the RPM locally on a Rocky Linux 9-compatible build environment, install Rust, the Linux GUI development libraries, and `rpm-build`, then run:
@@ -209,11 +209,11 @@ The generated RPM is placed in `target/rpm/`.
 
 ## 🚀 Build Packages on GitHub
 
-The GitHub Actions workflow builds the Ubuntu `.deb`, a RHEL-compatible `.rpm`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.12`):
+The GitHub Actions workflow builds the Ubuntu `.deb`, a RHEL-compatible `.rpm`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.13`):
 
 ```bash
-git tag v0.1.12
-git push origin v0.1.12
+git tag v0.1.13
+git push origin v0.1.13
 ```
 
 Once all platform builds finish, GitHub publishes a Release with the Linux, Windows, and macOS downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.
@@ -254,7 +254,7 @@ pg-mini only reads the extension's functions. It does not install, upgrade, or r
 
 ## High Availability (HA)
 
-pg-mini's HA work is intended to give administrators a clear view of PostgreSQL streaming-replication clusters and, in later phases, a guided way to provision a primary and standby. Provisioning is not implemented yet; pg-mini currently monitors existing servers and does not change PostgreSQL server configuration or perform failover.
+pg-mini provides PostgreSQL high-availability monitoring and a guided, manual workflow for setting up one physical-replication primary and standby. The monitoring view supports existing clusters; the setup guide targets matching PostgreSQL 17 or 18 servers. pg-mini does not automatically provision hosts or perform failover.
 
 ### HA monitoring (available)
 
@@ -265,17 +265,20 @@ pg-mini's HA work is intended to give administrators a clear view of PostgreSQL 
 - Monitoring queries are implemented for PostgreSQL 9.6 and later, including pre-10 WAL field/function names. This compatibility is not a live-test or certification claim for every release. PostgreSQL 9.6 is end-of-life; the upstream project currently lists PostgreSQL 14–18 as supported. PostgreSQL 10+ offers predefined monitoring roles including `pg_read_all_stats` and `pg_monitor`; grant only the access appropriate to your environment. See the official [monitoring statistics](https://www.postgresql.org/docs/18/monitoring-stats.html), [predefined roles](https://www.postgresql.org/docs/18/predefined-roles.html), and [versioning policy](https://www.postgresql.org/support/versioning/). The optional system identifier requires PostgreSQL 10+ and appropriate permission to read `pg_control_system()`.
 - pg-mini does not currently integrate with Patroni or repmgr.
 
-### HA provisioning roadmap (planned)
+### Guided physical replication setup (available)
 
-Initial provisioning scope should be physical streaming replication for one primary and one standby, targeting PostgreSQL 17 and 18. Those two supported major versions keep the first implementation focused on currently maintained releases; older-server monitoring compatibility does not imply provisioning support. Revisit the target as PostgreSQL releases reach end of life.
+The HA Overview includes a guided, manual setup flow for one PostgreSQL 17 or 18 primary and one standby. Physical streaming replication covers the entire PostgreSQL cluster (all databases), not a single selected database. Connect both saved profiles, select the primary and standby, and run the read-only preflight. It reports server version, recovery state, WAL settings, TLS status, role attributes, and the system identifier when the connected role can read it. Permission-restricted system identifiers remain explicitly unknown.
 
-1. **Preflight and plan** — Confirm both server versions, roles, connectivity, TLS, replication privileges, required settings, target data-directory state, and network reachability. Show a reviewed plan and explicit impact/backup warnings before any change.
-2. **Prepare the primary** — Create or validate a least-privilege replication role, check WAL sender/slot capacity and `wal_level`, and prepare an appropriately restricted `pg_hba.conf` rule. Detect whether a reload or restart is required; do not silently make network/firewall changes.
-3. **Bootstrap the standby** — Validate the target is safe to initialize, take a base backup, configure the standby connection and recovery signal, and start or reload the service as appropriate. Protect credentials, avoid logging secrets, and make destructive data-directory actions opt-in with clear confirmation.
-4. **Verify and monitor** — Confirm the standby connects to the intended primary using PostgreSQL metadata, verify receiver/sender state and progress, and show incomplete or permission-restricted checks as unknown. Provide actionable remediation without declaring success until checks pass.
-5. **Operate and recover** — Support safe re-check/retry, adding or removing a standby, and documented cleanup/rollback. Keep automatic failover, multi-standby orchestration, Patroni/repmgr management, and cross-version upgrades out of the initial provisioning scope.
+After entering the standby's source CIDR and reviewing the plan, pg-mini generates:
 
-**Execution model to settle before provisioning implementation:** PostgreSQL configuration files, data directories, and service restarts are operating-system-level operations; SQL access alone cannot safely perform all of them on arbitrary hosts. A safer first delivery is a guided workflow that generates and validates commands/configuration for administrator review, then records verification results. Fully automated remote provisioning would need an explicitly scoped and secured host-execution mechanism (for example, an opt-in SSH helper), separate from saved database credentials.
+- The SQL to create a login replication role and a separate interactive `psql \password` command (no password is generated or displayed).
+- Primary `wal_level`, sender/slot capacity, `listen_addresses`, TLS, and restricted `pg_hba.conf` guidance.
+- A `pg_basebackup` command for the standby, with TLS hostname verification, recovery configuration, and an optional physical replication slot.
+- Post-setup checks for primary/standby roles and matching system identifiers. The HA Overview continues to report live sender/receiver state and replication progress.
+
+**This is a manual guide, not remote provisioning.** pg-mini does not execute setup SQL, SSH to either host, write PostgreSQL configuration, manage services, open firewall ports, or change a data directory. An administrator must review and apply each step, arrange backups, and ensure the standby target directory is empty and safe to initialize. Keep the replication password in a protected `.pgpass` file, not in command history. A physical slot can retain WAL indefinitely while its standby is disconnected and may fill primary storage; monitor retained WAL and remove an unused slot only after confirming it is no longer needed.
+
+Provisioning is intentionally limited to matching PostgreSQL 17/18 major versions. HA monitoring supports a broader range as described above; monitoring compatibility does not mean provisioning support. Automated host provisioning, automatic failover, multi-standby management, and Patroni/repmgr integrations remain out of scope.
 
 ---
 
@@ -294,7 +297,7 @@ postgresql-manager/
 └── src/
     ├── main.rs           # Application entry point and window setup
     ├── app.rs            # Main eframe::App implementation and UI layout
-    ├── ha/               # HA node roles and status models
+    ├── ha/               # HA monitoring and guided replication setup
     ├── system_stats.rs   # system_stats extension query results
     ├── models.rs         # Data models (connections, query results, cells)
     ├── config.rs         # Persistent configuration (~/.config/pg-mini/)
@@ -302,6 +305,7 @@ postgresql-manager/
     └── ui/
         ├── mod.rs
         ├── ha_overview.rs      # HA node role overview
+        ├── ha_provisioning.rs  # Guided replication setup
         ├── system_stats.rs     # Optional host system statistics view
         ├── connection_modal.rs  # Connection dialog & profile manager
         ├── sidebar.rs           # Schema and table explorer
