@@ -9,6 +9,7 @@ use std::{
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 use crate::activity::{ActivityLock, ActivitySession, ActivitySnapshot, SizeEntry};
+use crate::ha::{HaNodeStatus, NodeRole};
 use crate::models::{
     AddColumnForm, CellValue, ColumnItem, ConnectionConfig, CreateTableForm, DatabaseItem,
     DbObjectItem, DbObjectKind, DbObjectRef, EditableCell, ObjectTreeKey, QueryResult, RoleForm,
@@ -22,6 +23,7 @@ pub enum DbRequest {
     FetchDatabases,
     FetchRoles,
     FetchActivity,
+    FetchHaStatus,
     SaveRole(RoleForm),
     DropRole(String),
     ExecuteDdl(String),
@@ -120,6 +122,7 @@ pub enum DbResponse {
     DatabasesFetched(Result<Vec<DatabaseItem>, String>),
     RolesFetched(Result<Vec<RoleItem>, String>),
     ActivityFetched(Result<ActivitySnapshot, String>),
+    HaStatusFetched(Result<HaNodeStatus, String>),
     SchemasFetched {
         database: String,
         result: Result<Vec<String>, String>,
@@ -222,6 +225,14 @@ impl DbWorker {
                                     let _ = res_tx.send(DbResponse::Busy(true));
                                     let result = fetch_activity_impl(client).await;
                                     let _ = res_tx.send(DbResponse::ActivityFetched(result));
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::FetchHaStatus => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    let result = fetch_ha_status_impl(client).await;
+                                    let _ = res_tx.send(DbResponse::HaStatusFetched(result));
                                     let _ = res_tx.send(DbResponse::Busy(false));
                                 }
                             }
@@ -782,6 +793,19 @@ impl DbWorker {
     pub fn try_recv(&self) -> Option<DbResponse> {
         self.res_rx.try_recv().ok()
     }
+}
+
+async fn fetch_ha_status_impl(client: &Client) -> Result<HaNodeStatus, String> {
+    let row = client
+        .query_one("SELECT pg_catalog.pg_is_in_recovery()", &[])
+        .await
+        .map_err(|error| format!("Failed to detect PostgreSQL node role: {error}"))?;
+    let is_in_recovery: bool = row
+        .try_get(0)
+        .map_err(|error| format!("Could not read PostgreSQL node role: {error}"))?;
+    Ok(HaNodeStatus {
+        role: NodeRole::from_recovery_state(is_in_recovery),
+    })
 }
 
 async fn connect_client(cfg: &ConnectionConfig) -> Result<(Client, String), String> {

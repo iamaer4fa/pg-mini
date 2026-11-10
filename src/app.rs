@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use crate::activity::ActivitySnapshot;
 use crate::config::ConfigManager;
 use crate::db::{DbRequest, DbResponse, DbWorker};
+use crate::ha::{HaNode, HaNodeStatus};
 use crate::models::{
     AppConfig, CellValue, ColumnItem, ConfirmAction, ConfirmDialogState, DatabaseItem,
     DbObjectKind, DbObjectRef, EditableCell, QueryResult, RoleItem, TableItem,
@@ -13,6 +14,7 @@ use crate::ui::columns_view::{ColumnsViewAction, render_columns_view};
 use crate::ui::connection_modal::{ConnectionModal, ConnectionModalAction};
 use crate::ui::data_table::{DataTableAction, DataTableState, export_to_csv, render_data_table};
 use crate::ui::dialogs::{AddColumnModal, CreateTableModal, ObjectDdlModal, render_confirm_dialog};
+use crate::ui::ha_overview::render_ha_overview;
 use crate::ui::roles::{RolesAction, RolesViewState};
 use crate::ui::sidebar::{Sidebar, SidebarAction};
 use crate::ui::sql_editor::{SqlEditor, SqlEditorAction};
@@ -25,6 +27,7 @@ pub enum ActiveTab {
     SchemaView,
     Roles,
     Activity,
+    HaOverview,
 }
 
 pub struct Toast {
@@ -39,6 +42,9 @@ struct ConnectedServer {
     current_db: String,
     host_port: String,
     is_busy: bool,
+    ha_status: Option<HaNodeStatus>,
+    ha_error: Option<String>,
+    ha_status_pending: bool,
 }
 
 pub struct PgMiniApp {
@@ -67,6 +73,10 @@ pub struct PgMiniApp {
     activity_snapshot: Option<ActivitySnapshot>,
     activity_updated_at: Option<Instant>,
     activity_last_requested: Option<Instant>,
+    active_ha_status: Option<HaNodeStatus>,
+    active_ha_error: Option<String>,
+    active_ha_status_pending: bool,
+    ha_last_requested: Option<Instant>,
     sql_editor: SqlEditor,
     last_query_result: Option<Result<QueryResult, String>>,
 
@@ -130,6 +140,10 @@ impl PgMiniApp {
             activity_snapshot: None,
             activity_updated_at: None,
             activity_last_requested: None,
+            active_ha_status: None,
+            active_ha_error: None,
+            active_ha_status_pending: false,
+            ha_last_requested: None,
             sql_editor,
             last_query_result: None,
             add_column_modal: AddColumnModal::default(),
@@ -156,6 +170,49 @@ impl PgMiniApp {
     fn request_activity_refresh(&mut self) {
         self.db_worker.send(DbRequest::FetchActivity);
         self.activity_last_requested = Some(Instant::now());
+    }
+
+    fn request_ha_refresh(&mut self) {
+        if self.is_connected && !self.active_ha_status_pending {
+            self.db_worker.send(DbRequest::FetchHaStatus);
+            self.active_ha_status_pending = true;
+            self.active_ha_error = None;
+        }
+        for server in &mut self.connected_servers {
+            if !server.ha_status_pending {
+                server.worker.send(DbRequest::FetchHaStatus);
+                server.ha_status_pending = true;
+                server.ha_error = None;
+            }
+        }
+        self.ha_last_requested = Some(Instant::now());
+    }
+
+    fn ha_nodes(&self) -> Vec<HaNode> {
+        let mut nodes = Vec::new();
+        if let Some(config) = &self.active_connection {
+            if self.is_connected {
+                nodes.push(HaNode {
+                    name: config.name.clone(),
+                    host_port: self.host_port.clone(),
+                    database: self.current_db.clone(),
+                    status: self.active_ha_status.clone(),
+                    error: self.active_ha_error.clone(),
+                    is_refreshing: self.active_ha_status_pending,
+                    is_active: true,
+                });
+            }
+        }
+        nodes.extend(self.connected_servers.iter().map(|server| HaNode {
+            name: server.config.name.clone(),
+            host_port: server.host_port.clone(),
+            database: server.current_db.clone(),
+            status: server.ha_status.clone(),
+            error: server.ha_error.clone(),
+            is_refreshing: server.ha_status_pending,
+            is_active: false,
+        }));
+        nodes
     }
 
     fn reset_active_server_view(&mut self) {
@@ -203,6 +260,9 @@ impl PgMiniApp {
                     current_db: self.current_db.clone(),
                     host_port: self.host_port.clone(),
                     is_busy: self.is_busy,
+                    ha_status: self.active_ha_status.take(),
+                    ha_error: self.active_ha_error.take(),
+                    ha_status_pending: self.active_ha_status_pending,
                 });
             }
         }
@@ -210,6 +270,9 @@ impl PgMiniApp {
         self.is_connected = false;
         self.is_busy = false;
         self.active_connection = None;
+        self.active_ha_status = None;
+        self.active_ha_error = None;
+        self.active_ha_status_pending = false;
         self.pending_connection = Some(config.clone());
         self.current_db.clear();
         self.host_port.clear();
@@ -238,6 +301,9 @@ impl PgMiniApp {
                     current_db: self.current_db.clone(),
                     host_port: self.host_port.clone(),
                     is_busy: self.is_busy,
+                    ha_status: self.active_ha_status.take(),
+                    ha_error: self.active_ha_error.take(),
+                    ha_status_pending: self.active_ha_status_pending,
                 });
             }
         }
@@ -247,6 +313,10 @@ impl PgMiniApp {
         self.host_port = server.host_port;
         self.is_connected = true;
         self.is_busy = server.is_busy;
+        self.active_ha_status = server.ha_status;
+        self.active_ha_error = server.ha_error;
+        self.active_ha_status_pending = server.ha_status_pending;
+        self.ha_last_requested = None;
         self.pending_connection = None;
         self.connection_modal.is_open = false;
         self.reset_active_server_view();
@@ -271,6 +341,20 @@ impl PgMiniApp {
                     }
                     DbResponse::ConnectionFailed(error) | DbResponse::OperationFailed(error) => {
                         errors.push(format!("{}: {}", server.config.name, error));
+                    }
+                    DbResponse::HaStatusFetched(result) => {
+                        server.ha_status_pending = false;
+                        match result {
+                            Ok(status) => {
+                                server.ha_status = Some(status);
+                                server.ha_error = None;
+                            }
+                            Err(error) => {
+                                server.ha_status = None;
+                                server.ha_error = Some(error.clone());
+                                errors.push(format!("{}: {}", server.config.name, error));
+                            }
+                        }
                     }
                     DbResponse::QueryResult(Err(error))
                     | DbResponse::TableDataResult(Err(error))
@@ -327,11 +411,19 @@ impl PgMiniApp {
                     if self.active_tab == ActiveTab::Activity {
                         self.request_activity_refresh();
                     }
+                    self.active_ha_status = None;
+                    self.active_ha_error = None;
+                    self.active_ha_status_pending = false;
+                    self.ha_last_requested = None;
+                    self.request_ha_refresh();
                 }
                 DbResponse::ConnectionFailed(err) => {
                     self.is_connected = false;
                     self.active_connection = None;
                     self.pending_connection = None;
+                    self.active_ha_status = None;
+                    self.active_ha_error = None;
+                    self.active_ha_status_pending = false;
                     self.connection_modal.error_message = Some(err.clone());
                     self.show_toast(format!("Connection error: {}", err), true);
                 }
@@ -339,6 +431,9 @@ impl PgMiniApp {
                     self.is_connected = false;
                     self.active_connection = None;
                     self.is_busy = false;
+                    self.active_ha_status = None;
+                    self.active_ha_error = None;
+                    self.active_ha_status_pending = false;
                     self.reset_active_server_view();
                     self.show_toast("Disconnected from active PostgreSQL server", false);
                 }
@@ -429,6 +524,20 @@ impl PgMiniApp {
                         self.show_toast(format!("Error fetching tables: {}", e), true);
                     }
                 },
+                DbResponse::HaStatusFetched(result) => {
+                    self.active_ha_status_pending = false;
+                    match result {
+                        Ok(status) => {
+                            self.active_ha_status = Some(status);
+                            self.active_ha_error = None;
+                        }
+                        Err(error) => {
+                            self.active_ha_status = None;
+                            self.active_ha_error = Some(error.clone());
+                            self.show_toast(error, true);
+                        }
+                    }
+                }
                 DbResponse::TableDataResult(res) => match res {
                     Ok(data) => {
                         self.current_table_data = Some(data);
@@ -508,6 +617,15 @@ impl eframe::App for PgMiniApp {
                     .is_none_or(|last| last.elapsed() >= Duration::from_secs(15))
             {
                 self.request_activity_refresh();
+            }
+        }
+        if self.active_tab == ActiveTab::HaOverview {
+            ctx.request_repaint_after(Duration::from_secs(1));
+            if self
+                .ha_last_requested
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(15))
+            {
+                self.request_ha_refresh();
             }
         }
 
@@ -912,6 +1030,14 @@ impl eframe::App for PgMiniApp {
                         self.request_activity_refresh();
                     }
                 }
+                if ui
+                    .selectable_label(self.active_tab == ActiveTab::HaOverview, "🟢 HA Overview")
+                    .clicked()
+                {
+                    self.active_tab = ActiveTab::HaOverview;
+                    self.ha_last_requested = None;
+                    self.request_ha_refresh();
+                }
             });
 
             ui.separator();
@@ -1151,6 +1277,12 @@ impl eframe::App for PgMiniApp {
                         self.request_activity_refresh();
                     }
                 }
+                ActiveTab::HaOverview => {
+                    let nodes = self.ha_nodes();
+                    if render_ha_overview(ui, &nodes, self.is_busy) {
+                        self.request_ha_refresh();
+                    }
+                }
             }
         });
 
@@ -1236,10 +1368,7 @@ impl eframe::App for PgMiniApp {
             self.db_worker.send(DbRequest::CreateTable(form));
         }
 
-        if let Some(sql) = self
-            .object_ddl_modal
-            .show(ctx, self.is_busy, &self.roles)
-        {
+        if let Some(sql) = self.object_ddl_modal.show(ctx, self.is_busy, &self.roles) {
             self.db_worker.send(DbRequest::ExecuteDdl(sql));
         }
 

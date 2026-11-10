@@ -1,7 +1,8 @@
-pub mod app;
 pub mod activity;
+pub mod app;
 pub mod config;
 pub mod db;
+pub mod ha;
 pub mod models;
 pub mod profile_io;
 pub mod sql_ddl;
