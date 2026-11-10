@@ -1,9 +1,11 @@
 use egui::{CentralPanel, Color32, RichText, SidePanel, TopBottomPanel};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::activity::ActivitySnapshot;
 use crate::config::ConfigManager;
 use crate::db::{DbRequest, DbResponse, DbWorker};
+use crate::ha::{HaEventSeverity, HaNode, HaNodeStatus, HaStatusChange, ReplicationStatus};
 use crate::models::{
     AppConfig, CellValue, ColumnItem, ConfirmAction, ConfirmDialogState, DatabaseItem,
     DbObjectKind, DbObjectRef, EditableCell, QueryResult, RoleItem, TableItem,
@@ -13,6 +15,7 @@ use crate::ui::columns_view::{ColumnsViewAction, render_columns_view};
 use crate::ui::connection_modal::{ConnectionModal, ConnectionModalAction};
 use crate::ui::data_table::{DataTableAction, DataTableState, export_to_csv, render_data_table};
 use crate::ui::dialogs::{AddColumnModal, CreateTableModal, ObjectDdlModal, render_confirm_dialog};
+use crate::ui::ha_overview::render_ha_overview;
 use crate::ui::roles::{RolesAction, RolesViewState};
 use crate::ui::sidebar::{Sidebar, SidebarAction};
 use crate::ui::sql_editor::{SqlEditor, SqlEditorAction};
@@ -25,6 +28,7 @@ pub enum ActiveTab {
     SchemaView,
     Roles,
     Activity,
+    HaOverview,
 }
 
 pub struct Toast {
@@ -39,6 +43,18 @@ struct ConnectedServer {
     current_db: String,
     host_port: String,
     is_busy: bool,
+    ha_status: Option<HaNodeStatus>,
+    ha_error: Option<String>,
+    ha_status_pending: bool,
+    ha_last_updated: Option<Instant>,
+}
+
+#[derive(Clone, Default)]
+struct HaNodeSnapshot {
+    status: Option<HaNodeStatus>,
+    error: Option<String>,
+    last_updated: Option<Instant>,
+    is_connected: bool,
 }
 
 pub struct PgMiniApp {
@@ -67,6 +83,15 @@ pub struct PgMiniApp {
     activity_snapshot: Option<ActivitySnapshot>,
     activity_updated_at: Option<Instant>,
     activity_last_requested: Option<Instant>,
+    active_ha_status: Option<HaNodeStatus>,
+    active_ha_error: Option<String>,
+    active_ha_status_pending: bool,
+    active_ha_last_updated: Option<Instant>,
+    ha_last_requested: Option<Instant>,
+    ha_new_cluster_name: String,
+    ha_selected_connection: Option<String>,
+    ha_events: VecDeque<HaStatusChange>,
+    ha_node_cache: HashMap<String, HaNodeSnapshot>,
     sql_editor: SqlEditor,
     last_query_result: Option<Result<QueryResult, String>>,
 
@@ -130,6 +155,15 @@ impl PgMiniApp {
             activity_snapshot: None,
             activity_updated_at: None,
             activity_last_requested: None,
+            active_ha_status: None,
+            active_ha_error: None,
+            active_ha_status_pending: false,
+            active_ha_last_updated: None,
+            ha_last_requested: None,
+            ha_new_cluster_name: String::new(),
+            ha_selected_connection: None,
+            ha_events: VecDeque::new(),
+            ha_node_cache: HashMap::new(),
             sql_editor,
             last_query_result: None,
             add_column_modal: AddColumnModal::default(),
@@ -156,6 +190,154 @@ impl PgMiniApp {
     fn request_activity_refresh(&mut self) {
         self.db_worker.send(DbRequest::FetchActivity);
         self.activity_last_requested = Some(Instant::now());
+    }
+
+    fn request_ha_refresh(&mut self) {
+        let mut requested = false;
+        if self.is_connected && !self.is_busy && !self.active_ha_status_pending {
+            self.db_worker.send(DbRequest::FetchHaStatus);
+            self.active_ha_status_pending = true;
+            requested = true;
+        }
+        for server in &mut self.connected_servers {
+            if !server.is_busy && !server.ha_status_pending {
+                server.worker.send(DbRequest::FetchHaStatus);
+                server.ha_status_pending = true;
+                requested = true;
+            }
+        }
+        if requested {
+            self.ha_last_requested = Some(Instant::now());
+        } else if !self.active_ha_status_pending
+            && !self
+                .connected_servers
+                .iter()
+                .any(|server| server.ha_status_pending)
+        {
+            self.ha_last_requested = None;
+        }
+    }
+
+    fn record_ha_event(&mut self, severity: HaEventSeverity, message: String) {
+        if severity != HaEventSeverity::Info {
+            self.show_toast(message.clone(), true);
+        }
+        self.ha_events.push_front(HaStatusChange {
+            occurred_at: Instant::now(),
+            severity,
+            message,
+        });
+        self.ha_events.truncate(100);
+    }
+
+    fn record_node_status_change(
+        &mut self,
+        node_name: &str,
+        previous: Option<&HaNodeStatus>,
+        current: &HaNodeStatus,
+    ) {
+        if let Some(previous) = previous {
+            if previous.role != current.role {
+                self.record_ha_event(
+                    HaEventSeverity::Critical,
+                    format!(
+                        "{node_name} role changed from {} to {}",
+                        previous.role.label(),
+                        current.role.label()
+                    ),
+                );
+            }
+        } else {
+            self.record_ha_event(
+                HaEventSeverity::Info,
+                format!("{node_name} role detected as {}", current.role.label()),
+            );
+        }
+
+        if self.config.ha_monitoring.alert_on_lag {
+            let threshold = self.config.ha_monitoring.lag_threshold_seconds;
+            let current_lag = max_reported_lag(current);
+            let previous_lag = previous.and_then(max_reported_lag);
+            if current_lag.is_some_and(|lag| lag > threshold)
+                && !previous_lag.is_some_and(|lag| lag > threshold)
+            {
+                self.record_ha_event(
+                    HaEventSeverity::Warning,
+                    format!(
+                        "{node_name} reported replication lag above {:.3}s",
+                        threshold
+                    ),
+                );
+            }
+        }
+    }
+
+    fn ha_nodes(&self) -> Vec<HaNode> {
+        self.config
+            .saved_connections
+            .iter()
+            .map(|config| {
+                if self
+                    .active_connection
+                    .as_ref()
+                    .is_some_and(|active| active.id == config.id)
+                    && self.is_connected
+                {
+                    return HaNode {
+                        connection_id: config.id.clone(),
+                        name: config.name.clone(),
+                        host_port: self.host_port.clone(),
+                        database: self.current_db.clone(),
+                        configured_host: config.host.clone(),
+                        configured_port: config.port,
+                        status: self.active_ha_status.clone(),
+                        error: self.active_ha_error.clone(),
+                        last_updated: self.active_ha_last_updated,
+                        is_refreshing: self.active_ha_status_pending,
+                        is_connected: true,
+                    };
+                }
+
+                if let Some(server) = self
+                    .connected_servers
+                    .iter()
+                    .find(|server| server.config.id == config.id)
+                {
+                    return HaNode {
+                        connection_id: config.id.clone(),
+                        name: config.name.clone(),
+                        host_port: server.host_port.clone(),
+                        database: server.current_db.clone(),
+                        configured_host: server.config.host.clone(),
+                        configured_port: server.config.port,
+                        status: server.ha_status.clone(),
+                        error: server.ha_error.clone(),
+                        last_updated: server.ha_last_updated,
+                        is_refreshing: server.ha_status_pending,
+                        is_connected: true,
+                    };
+                }
+
+                let cached = self
+                    .ha_node_cache
+                    .get(&config.id)
+                    .cloned()
+                    .unwrap_or_default();
+                HaNode {
+                    connection_id: config.id.clone(),
+                    name: config.name.clone(),
+                    host_port: format!("{}:{}", config.host, config.port),
+                    database: config.database.clone(),
+                    configured_host: config.host.clone(),
+                    configured_port: config.port,
+                    status: cached.status,
+                    error: cached.error,
+                    last_updated: cached.last_updated,
+                    is_refreshing: false,
+                    is_connected: cached.is_connected,
+                }
+            })
+            .collect()
     }
 
     fn reset_active_server_view(&mut self) {
@@ -203,6 +385,10 @@ impl PgMiniApp {
                     current_db: self.current_db.clone(),
                     host_port: self.host_port.clone(),
                     is_busy: self.is_busy,
+                    ha_status: self.active_ha_status.take(),
+                    ha_error: self.active_ha_error.take(),
+                    ha_status_pending: self.active_ha_status_pending,
+                    ha_last_updated: self.active_ha_last_updated,
                 });
             }
         }
@@ -210,6 +396,10 @@ impl PgMiniApp {
         self.is_connected = false;
         self.is_busy = false;
         self.active_connection = None;
+        self.active_ha_status = None;
+        self.active_ha_error = None;
+        self.active_ha_status_pending = false;
+        self.active_ha_last_updated = None;
         self.pending_connection = Some(config.clone());
         self.current_db.clear();
         self.host_port.clear();
@@ -238,6 +428,10 @@ impl PgMiniApp {
                     current_db: self.current_db.clone(),
                     host_port: self.host_port.clone(),
                     is_busy: self.is_busy,
+                    ha_status: self.active_ha_status.take(),
+                    ha_error: self.active_ha_error.take(),
+                    ha_status_pending: self.active_ha_status_pending,
+                    ha_last_updated: self.active_ha_last_updated,
                 });
             }
         }
@@ -247,6 +441,11 @@ impl PgMiniApp {
         self.host_port = server.host_port;
         self.is_connected = true;
         self.is_busy = server.is_busy;
+        self.active_ha_status = server.ha_status;
+        self.active_ha_error = server.ha_error;
+        self.active_ha_status_pending = server.ha_status_pending;
+        self.active_ha_last_updated = server.ha_last_updated;
+        self.ha_last_requested = None;
         self.pending_connection = None;
         self.connection_modal.is_open = false;
         self.reset_active_server_view();
@@ -262,15 +461,81 @@ impl PgMiniApp {
     fn poll_inactive_server_responses(&mut self) {
         let mut errors = Vec::new();
         let mut disconnected_server_ids = Vec::new();
+        let mut status_changes = Vec::new();
+        let mut new_events = Vec::new();
         for server in &mut self.connected_servers {
             while let Some(response) = server.worker.try_recv() {
                 match response {
                     DbResponse::Busy(is_busy) => server.is_busy = is_busy,
                     DbResponse::Disconnected => {
                         disconnected_server_ids.push(server.config.id.clone());
+                        if let Some(snapshot) = self.ha_node_cache.get_mut(&server.config.id) {
+                            snapshot.is_connected = false;
+                        }
+                        new_events.push((
+                            HaEventSeverity::Warning,
+                            format!("{} disconnected", server.config.name),
+                        ));
                     }
                     DbResponse::ConnectionFailed(error) | DbResponse::OperationFailed(error) => {
                         errors.push(format!("{}: {}", server.config.name, error));
+                    }
+                    DbResponse::HaStatusFetched(result) => {
+                        server.ha_status_pending = false;
+                        match result {
+                            Ok(status) => {
+                                server.ha_last_updated = Some(Instant::now());
+                                if server.ha_error.is_some() {
+                                    new_events.push((
+                                        HaEventSeverity::Info,
+                                        format!(
+                                            "{} HA status checks recovered",
+                                            server.config.name
+                                        ),
+                                    ));
+                                }
+                                status_changes.push((
+                                    server.config.name.clone(),
+                                    server.ha_status.clone(),
+                                    status.clone(),
+                                ));
+                                self.ha_node_cache.insert(
+                                    server.config.id.clone(),
+                                    HaNodeSnapshot {
+                                        status: Some(status.clone()),
+                                        error: None,
+                                        last_updated: server.ha_last_updated,
+                                        is_connected: true,
+                                    },
+                                );
+                                server.ha_status = Some(status);
+                                server.ha_error = None;
+                            }
+                            Err(error) => {
+                                if server.ha_error.is_none()
+                                    && self.config.ha_monitoring.alert_on_status_check_failure
+                                {
+                                    new_events.push((
+                                        HaEventSeverity::Warning,
+                                        format!(
+                                            "{} HA status check failed: {error}",
+                                            server.config.name
+                                        ),
+                                    ));
+                                }
+                                self.ha_node_cache.insert(
+                                    server.config.id.clone(),
+                                    HaNodeSnapshot {
+                                        status: server.ha_status.clone(),
+                                        error: Some(error.clone()),
+                                        last_updated: server.ha_last_updated,
+                                        is_connected: true,
+                                    },
+                                );
+                                server.ha_error = Some(error.clone());
+                                errors.push(format!("{}: {}", server.config.name, error));
+                            }
+                        }
                     }
                     DbResponse::QueryResult(Err(error))
                     | DbResponse::TableDataResult(Err(error))
@@ -299,6 +564,12 @@ impl PgMiniApp {
         for error in errors {
             self.show_toast(error, true);
         }
+        for (node_name, previous, current) in status_changes {
+            self.record_node_status_change(&node_name, previous.as_ref(), &current);
+        }
+        for (severity, message) in new_events {
+            self.record_ha_event(severity, message);
+        }
     }
 
     fn poll_db_responses(&mut self, ctx: &egui::Context) {
@@ -319,6 +590,11 @@ impl PgMiniApp {
                         format!("Connected to {} on {}", current_db, host_port),
                         false,
                     );
+                    if let Some(connection) = &self.active_connection {
+                        let snapshot = self.ha_node_cache.entry(connection.id.clone()).or_default();
+                        snapshot.is_connected = true;
+                        snapshot.error = None;
+                    }
                     self.sidebar.reset_object_tree();
                     self.db_worker.send(DbRequest::FetchDatabases);
                     if self.active_tab == ActiveTab::Roles {
@@ -327,18 +603,59 @@ impl PgMiniApp {
                     if self.active_tab == ActiveTab::Activity {
                         self.request_activity_refresh();
                     }
+                    let cached = self
+                        .active_connection
+                        .as_ref()
+                        .and_then(|connection| self.ha_node_cache.get(&connection.id))
+                        .cloned()
+                        .unwrap_or_default();
+                    self.active_ha_status = cached.status;
+                    self.active_ha_error = None;
+                    self.active_ha_status_pending = false;
+                    self.active_ha_last_updated = cached.last_updated;
+                    self.ha_last_requested = None;
+                    self.request_ha_refresh();
                 }
                 DbResponse::ConnectionFailed(err) => {
+                    if let Some(connection) = self.pending_connection.take() {
+                        let snapshot = self.ha_node_cache.entry(connection.id).or_default();
+                        snapshot.is_connected = false;
+                        snapshot.error = Some(err.clone());
+                        if self.config.ha_monitoring.alert_on_status_check_failure {
+                            self.record_ha_event(
+                                HaEventSeverity::Warning,
+                                format!("{} connection failed: {err}", connection.name),
+                            );
+                        }
+                    }
                     self.is_connected = false;
                     self.active_connection = None;
-                    self.pending_connection = None;
+                    self.active_ha_status = None;
+                    self.active_ha_error = None;
+                    self.active_ha_status_pending = false;
+                    self.active_ha_last_updated = None;
                     self.connection_modal.error_message = Some(err.clone());
                     self.show_toast(format!("Connection error: {}", err), true);
                 }
                 DbResponse::Disconnected => {
+                    if let Some(connection) = &self.active_connection {
+                        if let Some(snapshot) = self.ha_node_cache.get_mut(&connection.id) {
+                            snapshot.is_connected = false;
+                        }
+                    }
+                    if let Some(connection) = &self.active_connection {
+                        self.record_ha_event(
+                            HaEventSeverity::Warning,
+                            format!("{} disconnected", connection.name),
+                        );
+                    }
                     self.is_connected = false;
                     self.active_connection = None;
                     self.is_busy = false;
+                    self.active_ha_status = None;
+                    self.active_ha_error = None;
+                    self.active_ha_status_pending = false;
+                    self.active_ha_last_updated = None;
                     self.reset_active_server_view();
                     self.show_toast("Disconnected from active PostgreSQL server", false);
                 }
@@ -429,6 +746,77 @@ impl PgMiniApp {
                         self.show_toast(format!("Error fetching tables: {}", e), true);
                     }
                 },
+                DbResponse::HaStatusFetched(result) => {
+                    self.active_ha_status_pending = false;
+                    match result {
+                        Ok(status) => {
+                            self.active_ha_last_updated = Some(Instant::now());
+                            if self.active_ha_error.is_some() {
+                                let name = self
+                                    .active_connection
+                                    .as_ref()
+                                    .map(|connection| connection.name.as_str())
+                                    .unwrap_or("Active server");
+                                self.record_ha_event(
+                                    HaEventSeverity::Info,
+                                    format!("{name} HA status checks recovered"),
+                                );
+                            }
+                            let name = self
+                                .active_connection
+                                .as_ref()
+                                .map(|connection| connection.name.clone())
+                                .unwrap_or_else(|| "Active server".to_string());
+                            let previous_status = self.active_ha_status.clone();
+                            self.record_node_status_change(
+                                &name,
+                                previous_status.as_ref(),
+                                &status,
+                            );
+                            self.active_ha_status = Some(status);
+                            self.active_ha_error = None;
+                            if let Some(connection) = &self.active_connection {
+                                self.ha_node_cache.insert(
+                                    connection.id.clone(),
+                                    HaNodeSnapshot {
+                                        status: self.active_ha_status.clone(),
+                                        error: None,
+                                        last_updated: self.active_ha_last_updated,
+                                        is_connected: true,
+                                    },
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            if self.active_ha_error.is_none()
+                                && self.config.ha_monitoring.alert_on_status_check_failure
+                            {
+                                let name = self
+                                    .active_connection
+                                    .as_ref()
+                                    .map(|connection| connection.name.as_str())
+                                    .unwrap_or("Active server");
+                                self.record_ha_event(
+                                    HaEventSeverity::Warning,
+                                    format!("{name} HA status check failed: {error}"),
+                                );
+                            }
+                            self.active_ha_error = Some(error.clone());
+                            if let Some(connection) = &self.active_connection {
+                                self.ha_node_cache.insert(
+                                    connection.id.clone(),
+                                    HaNodeSnapshot {
+                                        status: self.active_ha_status.clone(),
+                                        error: Some(error.clone()),
+                                        last_updated: self.active_ha_last_updated,
+                                        is_connected: true,
+                                    },
+                                );
+                            }
+                            self.show_toast(error, true);
+                        }
+                    }
+                }
                 DbResponse::TableDataResult(res) => match res {
                     Ok(data) => {
                         self.current_table_data = Some(data);
@@ -496,6 +884,23 @@ impl PgMiniApp {
     }
 }
 
+fn max_reported_lag(status: &HaNodeStatus) -> Option<f64> {
+    match &status.replication {
+        ReplicationStatus::Primary { standbys } => standbys
+            .iter()
+            .flat_map(|standby| {
+                [
+                    standby.write_lag_seconds,
+                    standby.flush_lag_seconds,
+                    standby.replay_lag_seconds,
+                ]
+            })
+            .flatten()
+            .reduce(f64::max),
+        ReplicationStatus::Standby { .. } | ReplicationStatus::Unknown { .. } => None,
+    }
+}
+
 impl eframe::App for PgMiniApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_db_responses(ctx);
@@ -508,6 +913,20 @@ impl eframe::App for PgMiniApp {
                     .is_none_or(|last| last.elapsed() >= Duration::from_secs(15))
             {
                 self.request_activity_refresh();
+            }
+        }
+        if self.is_connected || !self.connected_servers.is_empty() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+            if self.ha_last_requested.is_none_or(|last| {
+                last.elapsed()
+                    >= Duration::from_secs(
+                        self.config
+                            .ha_monitoring
+                            .refresh_interval_seconds
+                            .clamp(5, 300),
+                    )
+            }) {
+                self.request_ha_refresh();
             }
         }
 
@@ -912,6 +1331,14 @@ impl eframe::App for PgMiniApp {
                         self.request_activity_refresh();
                     }
                 }
+                if ui
+                    .selectable_label(self.active_tab == ActiveTab::HaOverview, "🟢 HA Overview")
+                    .clicked()
+                {
+                    self.active_tab = ActiveTab::HaOverview;
+                    self.ha_last_requested = None;
+                    self.request_ha_refresh();
+                }
             });
 
             ui.separator();
@@ -1151,6 +1578,31 @@ impl eframe::App for PgMiniApp {
                         self.request_activity_refresh();
                     }
                 }
+                ActiveTab::HaOverview => {
+                    let nodes = self.ha_nodes();
+                    let (refresh, config_changed) = render_ha_overview(
+                        ui,
+                        &mut self.config.ha_clusters,
+                        &self.config.saved_connections,
+                        &nodes,
+                        self.is_busy,
+                        &mut self.config.ha_monitoring,
+                        &self.ha_events,
+                        &mut self.ha_new_cluster_name,
+                        &mut self.ha_selected_connection,
+                    );
+                    if refresh {
+                        self.request_ha_refresh();
+                    }
+                    if config_changed {
+                        match ConfigManager::save(&self.config) {
+                            Ok(()) => self.show_toast("HA cluster configuration saved", false),
+                            Err(error) => self.show_toast(error, true),
+                        }
+                        self.ha_last_requested = None;
+                        self.request_ha_refresh();
+                    }
+                }
             }
         });
 
@@ -1236,10 +1688,7 @@ impl eframe::App for PgMiniApp {
             self.db_worker.send(DbRequest::CreateTable(form));
         }
 
-        if let Some(sql) = self
-            .object_ddl_modal
-            .show(ctx, self.is_busy, &self.roles)
-        {
+        if let Some(sql) = self.object_ddl_modal.show(ctx, self.is_busy, &self.roles) {
             self.db_worker.send(DbRequest::ExecuteDdl(sql));
         }
 

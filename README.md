@@ -107,6 +107,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 - **Schema DDL Forms**: Create indexes, foreign keys, CHECK/UNIQUE/PRIMARY KEY constraints, views, and sequences from object-browser context menus; inspect generated SQL previews before execution.
 - **Table Grants**: Grant or revoke table privileges for existing roles or `PUBLIC`, including grant option and revoke cascade controls, with a generated SQL preview.
 - **Activity Dashboard**: Monitor visible sessions, queries running at least five seconds, blocked sessions and lock waits, and the largest databases and tables. Refresh manually or automatically every 15 seconds while the dashboard is open.
+- **HA Overview**: Group saved connection profiles into named clusters, monitor each node's role, connection state, and last successful update, and view PostgreSQL streaming-replication state. Configure refresh and stale-data intervals; connected servers are monitored at the configured interval while pg-mini is running. Optionally alert on reported lag thresholds and failed status checks, and review recent role, connection, and alert changes. The in-memory change log and alerts are available only while pg-mini is running; this desktop monitor is not a substitute for server-side monitoring.
 - **Persistent Query History**: Keeps the latest 200 distinct queries in the app configuration, with search, load-into-editor, and copy actions.
 - **Error Reporting**: Clear, highlighted PostgreSQL error banners when syntax or constraints fail.
 
@@ -225,11 +226,13 @@ postgresql-manager/
 └── src/
     ├── main.rs           # Application entry point and window setup
     ├── app.rs            # Main eframe::App implementation and UI layout
+    ├── ha/               # HA node roles and status models
     ├── models.rs         # Data models (connections, query results, cells)
     ├── config.rs         # Persistent configuration (~/.config/pg-mini/)
     ├── db.rs             # Background Tokio worker & async tokio-postgres client
     └── ui/
         ├── mod.rs
+        ├── ha_overview.rs      # HA node role overview
         ├── connection_modal.rs  # Connection dialog & profile manager
         ├── sidebar.rs           # Schema and table explorer
         ├── data_table.rs        # Virtualized table grid & CSV export
@@ -245,6 +248,8 @@ postgresql-manager/
 - **PostgreSQL Client**: [`tokio-postgres`](https://docs.rs/tokio-postgres) (pure asynchronous wire-protocol implementation in Rust, without external C `libpq` dependencies).
 - **Concurrency**: Messages between the GUI and the database worker are exchanged asynchronously over standard channels, ensuring zero UI freezes during query execution.
 - **Object Catalogs**: The browser queries PostgreSQL `pg_catalog`; each expanded object group is loaded asynchronously through the existing database worker.
+- **HA Monitoring**: The overview uses `pg_is_in_recovery()`, `pg_stat_replication`, `pg_stat_wal_receiver`, and (when permitted) `pg_control_system()` metadata. Cluster associations and monitoring thresholds are stored in the local app configuration. A standby's reported sender endpoint is matched against configured primary endpoints, and system identifiers are compared where available; unavailable or conflicting evidence is reported rather than silently treated as a confirmed relationship. Failed status checks retain the last successful snapshot and mark it stale when the configured age is exceeded. Recent changes are held in memory for the current app session only. Replication configuration and failover are not managed by pg-mini.
+- **HA compatibility and permissions**: Native HA queries are designed for PostgreSQL 9.6 and later, including the legacy `*_location` WAL-position names and replay function used before PostgreSQL 10. PostgreSQL 9.6 is end-of-life; the upstream project currently lists PostgreSQL 14–18 as supported, but pg-mini has not been live-tested or certified against each server release. Primary metrics include each reported WAL sender's state, sync mode, sent/write/flush/replay position, and server-reported write/flush/replay lag. Standby metrics include the WAL receiver's reported connection state, sender, slot, receive positions/times, and replay position/time. Lag fields can be absent or `NULL` (including when the server cannot calculate them); these remain unknown. No receiver row means none was reported at sampling time, not that replication is healthy. Ordinary monitoring roles may see limited or `NULL` statistics for other sessions; grant only the needed monitoring privileges. PostgreSQL 10 and later provide predefined roles such as `pg_read_all_stats` and `pg_monitor`; consult the official [monitoring statistics](https://www.postgresql.org/docs/18/monitoring-stats.html) and [predefined roles](https://www.postgresql.org/docs/18/predefined-roles.html) documentation before granting access. The optional system identifier is only queried on PostgreSQL 10 and later and may remain unavailable if permissions prevent reading it. pg-mini does not currently integrate with Patroni or repmgr; manager-specific status and control APIs are deferred until an integration and authentication scope are selected. See the upstream [PostgreSQL versioning policy](https://www.postgresql.org/support/versioning/) for current release support.
 - **Configuration**: JSON-serialized settings stored in standard XDG config directories via `dirs`.
 
 ---

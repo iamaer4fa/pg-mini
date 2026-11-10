@@ -638,6 +638,10 @@ pub struct AppConfig {
     pub dark_mode: bool,
     #[serde(default)]
     pub query_history: Vec<String>,
+    #[serde(default)]
+    pub ha_clusters: Vec<crate::ha::HaCluster>,
+    #[serde(default)]
+    pub ha_monitoring: crate::ha::HaMonitoringConfig,
 }
 
 fn default_true() -> bool {
@@ -651,6 +655,8 @@ impl Default for AppConfig {
             last_connection_id: None,
             dark_mode: true,
             query_history: Vec::new(),
+            ha_clusters: Vec::new(),
+            ha_monitoring: crate::ha::HaMonitoringConfig::default(),
         }
     }
 }
