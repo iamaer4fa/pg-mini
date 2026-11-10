@@ -107,7 +107,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 - **Schema DDL Forms**: Create indexes, foreign keys, CHECK/UNIQUE/PRIMARY KEY constraints, views, and sequences from object-browser context menus; inspect generated SQL previews before execution.
 - **Table Grants**: Grant or revoke table privileges for existing roles or `PUBLIC`, including grant option and revoke cascade controls, with a generated SQL preview.
 - **Activity Dashboard**: Monitor visible sessions, queries running at least five seconds, blocked sessions and lock waits, and the largest databases and tables. Refresh manually or automatically every 15 seconds while the dashboard is open.
-- **HA Overview**: Group saved connection profiles into named clusters, monitor each node's role, connection state, and last successful update, and view PostgreSQL streaming-replication state. Configure refresh and stale-data intervals; connected servers are monitored at the configured interval while pg-mini is running. Optionally alert on reported lag thresholds and failed status checks, and review recent role, connection, and alert changes. The in-memory change log and alerts are available only while pg-mini is running; this desktop monitor is not a substitute for server-side monitoring.
+
 - **Persistent Query History**: Keeps the latest 200 distinct queries in the app configuration, with search, load-into-editor, and copy actions.
 - **Error Reporting**: Clear, highlighted PostgreSQL error banners when syntax or constraints fail.
 
@@ -177,7 +177,7 @@ Build a Debian package (including the desktop launcher and lightning icon):
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./target/debian/pg-mini_0.1.9_amd64.deb
+sudo apt install ./target/debian/pg-mini_0.1.10_amd64.deb
 ```
 
 The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop application launcher, and installs the icon in the hicolor icon theme.
@@ -188,11 +188,11 @@ To create a desktop shortcut manually, set `Exec` to the built executable and `I
 
 ## 🚀 Build Packages on GitHub
 
-The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.9`):
+The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.10`):
 
 ```bash
-git tag v0.1.9
-git push origin v0.1.9
+git tag v0.1.10
+git push origin v0.1.10
 ```
 
 Once all platform builds finish, GitHub publishes a Release with the Linux, Windows, and macOS downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.
@@ -208,6 +208,33 @@ Backup and restore call the PostgreSQL client utilities (`pg_dump`, `pg_restore`
 TLS mode **Prefer** attempts verified TLS first and falls back to plaintext if TLS negotiation fails; it does not retry in plaintext after the server returns a PostgreSQL error. Choose **Require** to prevent plaintext fallback. Both TLS modes validate the server certificate and hostname using the operating system trust store, augmented by the optional PEM CA certificate. Imported certificate paths are local paths and may need to be updated on the destination computer. Profile JSON exports omit passwords by default; password-inclusive exports contain credentials in plaintext and should be protected accordingly.
 
 The Activity dashboard is refreshed from PostgreSQL's statistics views and shows data visible to the connected database role; PostgreSQL may hide query text or other session details from non-privileged accounts.
+
+---
+
+## High Availability (HA)
+
+pg-mini's HA work is intended to give administrators a clear view of PostgreSQL streaming-replication clusters and, in later phases, a guided way to provision a primary and standby. Provisioning is not implemented yet; pg-mini currently monitors existing servers and does not change PostgreSQL server configuration or perform failover.
+
+### HA monitoring (available)
+
+- Group saved connection profiles into named clusters and view each node's role, reachability, last successful update, and reported replication state.
+- Read node role from `pg_is_in_recovery()`. Primary-side status is read from `pg_stat_replication`; standby-side status is read from `pg_stat_wal_receiver`. System identifiers are compared where available, and a standby's reported sender endpoint is matched against configured primary endpoints. Hostnames alone do not establish cluster membership.
+- Configure polling and stale-data intervals, optional reported-lag thresholds, and failed-check alerts. Failed checks retain the last successful snapshot and mark it stale after the configured threshold. Recent changes and alerts are kept only in memory while pg-mini is running; this desktop application is not a server-side monitoring or alerting service.
+- Treat missing fields and permission-restricted measurements as unknown. A missing WAL receiver row means none was reported at sampling time, not that replication is healthy. Lag values are PostgreSQL-reported measurements, may be `NULL` or unavailable, and are not estimates computed by pg-mini.
+- Monitoring queries are implemented for PostgreSQL 9.6 and later, including pre-10 WAL field/function names. This compatibility is not a live-test or certification claim for every release. PostgreSQL 9.6 is end-of-life; the upstream project currently lists PostgreSQL 14–18 as supported. PostgreSQL 10+ offers predefined monitoring roles including `pg_read_all_stats` and `pg_monitor`; grant only the access appropriate to your environment. See the official [monitoring statistics](https://www.postgresql.org/docs/18/monitoring-stats.html), [predefined roles](https://www.postgresql.org/docs/18/predefined-roles.html), and [versioning policy](https://www.postgresql.org/support/versioning/). The optional system identifier requires PostgreSQL 10+ and appropriate permission to read `pg_control_system()`.
+- pg-mini does not currently integrate with Patroni or repmgr.
+
+### HA provisioning roadmap (planned)
+
+Initial provisioning scope should be physical streaming replication for one primary and one standby, targeting PostgreSQL 17 and 18. Those two supported major versions keep the first implementation focused on currently maintained releases; older-server monitoring compatibility does not imply provisioning support. Revisit the target as PostgreSQL releases reach end of life.
+
+1. **Preflight and plan** — Confirm both server versions, roles, connectivity, TLS, replication privileges, required settings, target data-directory state, and network reachability. Show a reviewed plan and explicit impact/backup warnings before any change.
+2. **Prepare the primary** — Create or validate a least-privilege replication role, check WAL sender/slot capacity and `wal_level`, and prepare an appropriately restricted `pg_hba.conf` rule. Detect whether a reload or restart is required; do not silently make network/firewall changes.
+3. **Bootstrap the standby** — Validate the target is safe to initialize, take a base backup, configure the standby connection and recovery signal, and start or reload the service as appropriate. Protect credentials, avoid logging secrets, and make destructive data-directory actions opt-in with clear confirmation.
+4. **Verify and monitor** — Confirm the standby connects to the intended primary using PostgreSQL metadata, verify receiver/sender state and progress, and show incomplete or permission-restricted checks as unknown. Provide actionable remediation without declaring success until checks pass.
+5. **Operate and recover** — Support safe re-check/retry, adding or removing a standby, and documented cleanup/rollback. Keep automatic failover, multi-standby orchestration, Patroni/repmgr management, and cross-version upgrades out of the initial provisioning scope.
+
+**Execution model to settle before provisioning implementation:** PostgreSQL configuration files, data directories, and service restarts are operating-system-level operations; SQL access alone cannot safely perform all of them on arbitrary hosts. A safer first delivery is a guided workflow that generates and validates commands/configuration for administrator review, then records verification results. Fully automated remote provisioning would need an explicitly scoped and secured host-execution mechanism (for example, an opt-in SSH helper), separate from saved database credentials.
 
 ---
 
@@ -248,8 +275,6 @@ postgresql-manager/
 - **PostgreSQL Client**: [`tokio-postgres`](https://docs.rs/tokio-postgres) (pure asynchronous wire-protocol implementation in Rust, without external C `libpq` dependencies).
 - **Concurrency**: Messages between the GUI and the database worker are exchanged asynchronously over standard channels, ensuring zero UI freezes during query execution.
 - **Object Catalogs**: The browser queries PostgreSQL `pg_catalog`; each expanded object group is loaded asynchronously through the existing database worker.
-- **HA Monitoring**: The overview uses `pg_is_in_recovery()`, `pg_stat_replication`, `pg_stat_wal_receiver`, and (when permitted) `pg_control_system()` metadata. Cluster associations and monitoring thresholds are stored in the local app configuration. A standby's reported sender endpoint is matched against configured primary endpoints, and system identifiers are compared where available; unavailable or conflicting evidence is reported rather than silently treated as a confirmed relationship. Failed status checks retain the last successful snapshot and mark it stale when the configured age is exceeded. Recent changes are held in memory for the current app session only. Replication configuration and failover are not managed by pg-mini.
-- **HA compatibility and permissions**: Native HA queries are designed for PostgreSQL 9.6 and later, including the legacy `*_location` WAL-position names and replay function used before PostgreSQL 10. PostgreSQL 9.6 is end-of-life; the upstream project currently lists PostgreSQL 14–18 as supported, but pg-mini has not been live-tested or certified against each server release. Primary metrics include each reported WAL sender's state, sync mode, sent/write/flush/replay position, and server-reported write/flush/replay lag. Standby metrics include the WAL receiver's reported connection state, sender, slot, receive positions/times, and replay position/time. Lag fields can be absent or `NULL` (including when the server cannot calculate them); these remain unknown. No receiver row means none was reported at sampling time, not that replication is healthy. Ordinary monitoring roles may see limited or `NULL` statistics for other sessions; grant only the needed monitoring privileges. PostgreSQL 10 and later provide predefined roles such as `pg_read_all_stats` and `pg_monitor`; consult the official [monitoring statistics](https://www.postgresql.org/docs/18/monitoring-stats.html) and [predefined roles](https://www.postgresql.org/docs/18/predefined-roles.html) documentation before granting access. The optional system identifier is only queried on PostgreSQL 10 and later and may remain unavailable if permissions prevent reading it. pg-mini does not currently integrate with Patroni or repmgr; manager-specific status and control APIs are deferred until an integration and authentication scope are selected. See the upstream [PostgreSQL versioning policy](https://www.postgresql.org/support/versioning/) for current release support.
 - **Configuration**: JSON-serialized settings stored in standard XDG config directories via `dirs`.
 
 ---
