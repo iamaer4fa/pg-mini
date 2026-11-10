@@ -1704,41 +1704,48 @@ impl eframe::App for PgMiniApp {
                     }
                 }
                 ActiveTab::HaOverview => {
-                    let nodes = self.ha_nodes();
-                    let (refresh, config_changed) = render_ha_overview(
-                        ui,
-                        &mut self.config.ha_clusters,
-                        &self.config.saved_connections,
-                        &nodes,
-                        self.is_busy,
-                        &mut self.config.ha_monitoring,
-                        &self.ha_events,
-                        &mut self.ha_new_cluster_name,
-                        &mut self.ha_selected_connection,
-                    );
-                    if refresh {
-                        self.request_ha_refresh();
-                    }
-                    if config_changed {
-                        match ConfigManager::save(&self.config) {
-                            Ok(()) => self.show_toast("HA cluster configuration saved", false),
-                            Err(error) => self.show_toast(error, true),
-                        }
-                        self.ha_last_requested = None;
-                        self.request_ha_refresh();
-                    }
-                    let connected_ids = self.connected_connection_ids();
-                    let provisioning_busy = self.is_busy
-                        || self.connected_servers.iter().any(|server| server.is_busy);
-                    if let Some(connection_ids) = render_ha_provisioning(
-                        ui,
-                        &mut self.ha_provisioning,
-                        &self.config.saved_connections,
-                        &connected_ids,
-                        provisioning_busy,
-                    ) {
-                        self.request_provisioning_preflight(connection_ids);
-                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("ha_overview_content")
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            let nodes = self.ha_nodes();
+                            let (refresh, config_changed) = render_ha_overview(
+                                ui,
+                                &mut self.config.ha_clusters,
+                                &self.config.saved_connections,
+                                &nodes,
+                                self.is_busy,
+                                &mut self.config.ha_monitoring,
+                                &self.ha_events,
+                                &mut self.ha_new_cluster_name,
+                                &mut self.ha_selected_connection,
+                            );
+                            if refresh {
+                                self.request_ha_refresh();
+                            }
+                            if config_changed {
+                                match ConfigManager::save(&self.config) {
+                                    Ok(()) => {
+                                        self.show_toast("HA cluster configuration saved", false)
+                                    }
+                                    Err(error) => self.show_toast(error, true),
+                                }
+                                self.ha_last_requested = None;
+                                self.request_ha_refresh();
+                            }
+                            let connected_ids = self.connected_connection_ids();
+                            let provisioning_busy = self.is_busy
+                                || self.connected_servers.iter().any(|server| server.is_busy);
+                            if let Some(connection_ids) = render_ha_provisioning(
+                                ui,
+                                &mut self.ha_provisioning,
+                                &self.config.saved_connections,
+                                &connected_ids,
+                                provisioning_busy,
+                            ) {
+                                self.request_provisioning_preflight(connection_ids);
+                            }
+                        });
                 }
             }
         });
