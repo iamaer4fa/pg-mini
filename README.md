@@ -180,7 +180,7 @@ Build a Debian package (including the desktop launcher and lightning icon):
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./target/debian/pg-mini_0.1.12_amd64.deb
+sudo apt install ./target/debian/pg-mini_0.1.13_amd64.deb
 ```
 
 The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop application launcher, and installs the icon in the hicolor icon theme.
@@ -194,7 +194,7 @@ RPM packages are built on Rocky Linux 9 for x86_64 and target RHEL 9-compatible 
 On a supported distribution, install the downloaded package with:
 
 ```bash
-sudo dnf install ./pg-mini-0.1.12-1.el9.x86_64.rpm
+sudo dnf install ./pg-mini-0.1.13-1.el9.x86_64.rpm
 ```
 
 To build the RPM locally on a Rocky Linux 9-compatible build environment, install Rust, the Linux GUI development libraries, and `rpm-build`, then run:
@@ -209,11 +209,11 @@ The generated RPM is placed in `target/rpm/`.
 
 ## 🚀 Build Packages on GitHub
 
-The GitHub Actions workflow builds the Ubuntu `.deb`, a RHEL-compatible `.rpm`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.12`):
+The GitHub Actions workflow builds the Ubuntu `.deb`, a RHEL-compatible `.rpm`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.13`):
 
 ```bash
-git tag v0.1.12
-git push origin v0.1.12
+git tag v0.1.13
+git push origin v0.1.13
 ```
 
 Once all platform builds finish, GitHub publishes a Release with the Linux, Windows, and macOS downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.
