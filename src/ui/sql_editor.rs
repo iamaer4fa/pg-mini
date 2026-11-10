@@ -319,28 +319,6 @@ impl SqlEditor {
         });
 
         ui.add_space(4.0);
-        let resize_handle = ui
-            .allocate_response(
-                egui::vec2(ui.available_width(), 8.0),
-                egui::Sense::drag(),
-            )
-            .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-            .on_hover_text("Drag to resize the SQL editor");
-        if resize_handle.dragged() {
-            self.editor_height = resized_editor_height(self.editor_height, resize_handle.drag_delta().y);
-        }
-        let handle_color = if resize_handle.hovered() || resize_handle.dragged() {
-            ui.visuals().widgets.active.fg_stroke.color
-        } else {
-            ui.visuals().widgets.inactive.fg_stroke.color
-        };
-        ui.painter().line_segment(
-            [
-                egui::pos2(resize_handle.rect.left() + 6.0, resize_handle.rect.center().y),
-                egui::pos2(resize_handle.rect.right() - 6.0, resize_handle.rect.center().y),
-            ],
-            egui::Stroke::new(2.0_f32, handle_color),
-        );
         let completion_shortcut = ui.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Space));
         if completion_shortcut {
             self.show_completions = true;
@@ -366,6 +344,30 @@ impl SqlEditor {
                         .layouter(&mut layouter),
                 );
             });
+
+        let resize_handle = ui
+            .allocate_response(
+                egui::vec2(ui.available_width(), 8.0),
+                egui::Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+            .on_hover_text("Drag to resize the SQL editor");
+        if resize_handle.dragged() {
+            self.editor_height =
+                resized_editor_height(self.editor_height, resize_handle.drag_delta().y);
+        }
+        let handle_color = if resize_handle.hovered() || resize_handle.dragged() {
+            ui.visuals().widgets.active.fg_stroke.color
+        } else {
+            ui.visuals().widgets.inactive.fg_stroke.color
+        };
+        ui.painter().line_segment(
+            [
+                egui::pos2(resize_handle.rect.left() + 6.0, resize_handle.rect.center().y),
+                egui::pos2(resize_handle.rect.right() - 6.0, resize_handle.rect.center().y),
+            ],
+            egui::Stroke::new(2.0_f32, handle_color),
+        );
 
         if self.show_completions {
             let prefix = trailing_word(&self.sql_text).to_lowercase();
