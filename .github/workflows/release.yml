@@ -62,7 +62,6 @@ jobs:
             git \
             gzip \
             libX11-devel \
-            libX11-xcb-devel \
             libXcursor-devel \
             libXi-devel \
             libXrandr-devel \
