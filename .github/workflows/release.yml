@@ -55,7 +55,7 @@ jobs:
     steps:
       - name: Install build dependencies
         run: |
-          dnf install --assumeyes \
+          dnf install --assumeyes --allowerasing \
             curl \
             gcc \
             gcc-c++ \
