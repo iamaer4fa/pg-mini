@@ -10,6 +10,7 @@ use crate::models::{
     AppConfig, CellValue, ColumnItem, ConfirmAction, ConfirmDialogState, DatabaseItem,
     DbObjectKind, DbObjectRef, EditableCell, QueryResult, RoleItem, TableItem,
 };
+use crate::system_stats::SystemStatsSnapshot;
 use crate::ui::activity_view::render_activity_view;
 use crate::ui::columns_view::{ColumnsViewAction, render_columns_view};
 use crate::ui::connection_modal::{ConnectionModal, ConnectionModalAction};
@@ -19,6 +20,7 @@ use crate::ui::ha_overview::render_ha_overview;
 use crate::ui::roles::{RolesAction, RolesViewState};
 use crate::ui::sidebar::{Sidebar, SidebarAction};
 use crate::ui::sql_editor::{SqlEditor, SqlEditorAction};
+use crate::ui::system_stats::render_system_stats_view;
 use crate::ui::theme::setup_custom_theme;
 
 #[derive(PartialEq)]
@@ -28,6 +30,7 @@ pub enum ActiveTab {
     SchemaView,
     Roles,
     Activity,
+    SystemStats,
     HaOverview,
 }
 
@@ -83,6 +86,8 @@ pub struct PgMiniApp {
     activity_snapshot: Option<ActivitySnapshot>,
     activity_updated_at: Option<Instant>,
     activity_last_requested: Option<Instant>,
+    system_stats_snapshot: Option<SystemStatsSnapshot>,
+    system_stats_updated_at: Option<Instant>,
     active_ha_status: Option<HaNodeStatus>,
     active_ha_error: Option<String>,
     active_ha_status_pending: bool,
@@ -155,6 +160,8 @@ impl PgMiniApp {
             activity_snapshot: None,
             activity_updated_at: None,
             activity_last_requested: None,
+            system_stats_snapshot: None,
+            system_stats_updated_at: None,
             active_ha_status: None,
             active_ha_error: None,
             active_ha_status_pending: false,
@@ -190,6 +197,10 @@ impl PgMiniApp {
     fn request_activity_refresh(&mut self) {
         self.db_worker.send(DbRequest::FetchActivity);
         self.activity_last_requested = Some(Instant::now());
+    }
+
+    fn request_system_stats_refresh(&mut self) {
+        self.db_worker.send(DbRequest::FetchSystemStats);
     }
 
     fn request_ha_refresh(&mut self) {
@@ -350,6 +361,8 @@ impl PgMiniApp {
         self.activity_snapshot = None;
         self.activity_updated_at = None;
         self.activity_last_requested = None;
+        self.system_stats_snapshot = None;
+        self.system_stats_updated_at = None;
         self.last_query_result = None;
         self.table_data_state = DataTableState::default();
         self.sidebar.reset_object_tree();
@@ -455,6 +468,9 @@ impl PgMiniApp {
         if self.active_tab == ActiveTab::Activity {
             self.request_activity_refresh();
         }
+        if self.active_tab == ActiveTab::SystemStats {
+            self.request_system_stats_refresh();
+        }
         self.db_worker.send(DbRequest::FetchDatabases);
     }
 
@@ -542,6 +558,7 @@ impl PgMiniApp {
                     | DbResponse::DatabasesFetched(Err(error))
                     | DbResponse::RolesFetched(Err(error))
                     | DbResponse::ActivityFetched(Err(error))
+                    | DbResponse::SystemStatsFetched(Err(error))
                     | DbResponse::SchemasFetched {
                         result: Err(error), ..
                     }
@@ -602,6 +619,9 @@ impl PgMiniApp {
                     }
                     if self.active_tab == ActiveTab::Activity {
                         self.request_activity_refresh();
+                    }
+                    if self.active_tab == ActiveTab::SystemStats {
+                        self.request_system_stats_refresh();
                     }
                     let cached = self
                         .active_connection
@@ -678,6 +698,13 @@ impl PgMiniApp {
                     }
                     Err(error) => self.show_toast(error, true),
                 },
+                DbResponse::SystemStatsFetched(result) => match result {
+                    Ok(snapshot) => {
+                        self.system_stats_snapshot = Some(snapshot);
+                        self.system_stats_updated_at = Some(Instant::now());
+                    }
+                    Err(error) => self.show_toast(error, true),
+                },
                 DbResponse::SchemasFetched { database, result } => {
                     if database == self.current_db {
                         if let Err(error) = &result {
@@ -723,6 +750,8 @@ impl PgMiniApp {
                     server_version: _,
                 } => {
                     self.current_db = db_name.clone();
+                    self.system_stats_snapshot = None;
+                    self.system_stats_updated_at = None;
                     if let Some(connection) = &mut self.active_connection {
                         connection.database = db_name.clone();
                     }
@@ -737,6 +766,9 @@ impl PgMiniApp {
                     self.show_toast(format!("Switched to database '{}'", db_name), false);
                     // Object catalogs are fetched when their tree nodes are expanded.
                     self.db_worker.send(DbRequest::FetchDatabases);
+                    if self.active_tab == ActiveTab::SystemStats {
+                        self.request_system_stats_refresh();
+                    }
                 }
                 DbResponse::TablesFetched(res) => match res {
                     Ok(tables) => {
@@ -1336,6 +1368,18 @@ impl eframe::App for PgMiniApp {
                     }
                 }
                 if ui
+                    .selectable_label(
+                        self.active_tab == ActiveTab::SystemStats,
+                        "🖥 System Stats",
+                    )
+                    .clicked()
+                {
+                    self.active_tab = ActiveTab::SystemStats;
+                    if self.is_connected {
+                        self.request_system_stats_refresh();
+                    }
+                }
+                if ui
                     .selectable_label(self.active_tab == ActiveTab::HaOverview, "🟢 HA Overview")
                     .clicked()
                 {
@@ -1580,6 +1624,20 @@ impl eframe::App for PgMiniApp {
                         self.activity_updated_at,
                     ) {
                         self.request_activity_refresh();
+                    }
+                }
+                ActiveTab::SystemStats => {
+                    if !self.is_connected {
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Connect to a PostgreSQL server to view system statistics.");
+                        });
+                    } else if render_system_stats_view(
+                        ui,
+                        self.system_stats_snapshot.as_ref(),
+                        self.is_busy,
+                        self.system_stats_updated_at,
+                    ) {
+                        self.request_system_stats_refresh();
                     }
                 }
                 ActiveTab::HaOverview => {

@@ -6,6 +6,7 @@ pub mod ha;
 pub mod models;
 pub mod profile_io;
 pub mod sql_ddl;
+pub mod system_stats;
 pub mod ui;
 
 use app::PgMiniApp;

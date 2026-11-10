@@ -17,6 +17,7 @@ use crate::models::{
     DbObjectItem, DbObjectKind, DbObjectRef, EditableCell, ObjectTreeKey, QueryResult, RoleForm,
     RoleItem, TableItem, TlsMode,
 };
+use crate::system_stats::{SystemStatsSection, SystemStatsSnapshot, SYSTEM_STATS_FUNCTIONS};
 
 #[derive(Debug)]
 pub enum DbRequest {
@@ -25,6 +26,7 @@ pub enum DbRequest {
     FetchDatabases,
     FetchRoles,
     FetchActivity,
+    FetchSystemStats,
     FetchHaStatus,
     SaveRole(RoleForm),
     DropRole(String),
@@ -124,6 +126,7 @@ pub enum DbResponse {
     DatabasesFetched(Result<Vec<DatabaseItem>, String>),
     RolesFetched(Result<Vec<RoleItem>, String>),
     ActivityFetched(Result<ActivitySnapshot, String>),
+    SystemStatsFetched(Result<SystemStatsSnapshot, String>),
     HaStatusFetched(Result<HaNodeStatus, String>),
     SchemasFetched {
         database: String,
@@ -227,6 +230,14 @@ impl DbWorker {
                                     let _ = res_tx.send(DbResponse::Busy(true));
                                     let result = fetch_activity_impl(client).await;
                                     let _ = res_tx.send(DbResponse::ActivityFetched(result));
+                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                }
+                            }
+                            DbRequest::FetchSystemStats => {
+                                if let Some(client) = &current_client {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    let result = fetch_system_stats_impl(client).await;
+                                    let _ = res_tx.send(DbResponse::SystemStatsFetched(result));
                                     let _ = res_tx.send(DbResponse::Busy(false));
                                 }
                             }
@@ -1234,6 +1245,65 @@ async fn fetch_roles_impl(client: &Client) -> Result<Vec<RoleItem>, String> {
     }
 
     Ok(roles)
+}
+
+async fn fetch_system_stats_impl(client: &Client) -> Result<SystemStatsSnapshot, String> {
+    let extension_rows = client
+        .simple_query(
+            "SELECT namespace.nspname \
+             FROM pg_catalog.pg_extension AS extension \
+             JOIN pg_catalog.pg_namespace AS namespace \
+               ON namespace.oid = extension.extnamespace \
+             WHERE extension.extname = 'system_stats';",
+        )
+        .await
+        .map_err(|error| format!("Failed to check for system_stats extension: {error}"))?;
+
+    let extension_schema = extension_rows.into_iter().find_map(|message| match message {
+        SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+        _ => None,
+    });
+    let Some(extension_schema) = extension_schema else {
+        return Ok(SystemStatsSnapshot {
+            extension_schema: None,
+            sections: Vec::new(),
+        });
+    };
+
+    let mut sections = Vec::with_capacity(SYSTEM_STATS_FUNCTIONS.len());
+    for (title, function_name) in SYSTEM_STATS_FUNCTIONS {
+        let is_process_list = function_name == "pg_sys_cpu_memory_by_process";
+        let row_limit = if is_process_list { " LIMIT 201" } else { "" };
+        let query = format!(
+            "SELECT * FROM {}.{}(){};",
+            quote_sql_ident(&extension_schema),
+            quote_sql_ident(function_name),
+            row_limit
+        );
+        let mut result = execute_sql_impl(client, &query).await;
+        let mut is_truncated = false;
+        if let Ok(result) = &mut result {
+            if is_process_list && result.rows.len() > 200 {
+                result.rows.truncate(200);
+                is_truncated = true;
+            }
+        }
+        sections.push(SystemStatsSection {
+            title,
+            function_name,
+            result,
+            is_truncated,
+        });
+    }
+
+    Ok(SystemStatsSnapshot {
+        extension_schema: Some(extension_schema),
+        sections,
+    })
+}
+
+fn quote_sql_ident(ident: &str) -> String {
+    format!("\"{}\"", escape_sql_ident(ident))
 }
 
 async fn fetch_activity_impl(client: &Client) -> Result<ActivitySnapshot, String> {

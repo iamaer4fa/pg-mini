@@ -7,4 +7,5 @@ pub mod ha_overview;
 pub mod roles;
 pub mod sidebar;
 pub mod sql_editor;
+pub mod system_stats;
 pub mod theme;

@@ -3,6 +3,8 @@ use crate::ui::data_table::{DataTableAction, DataTableState, render_data_table};
 use egui::{Color32, Key, RichText, ScrollArea, Ui, text::LayoutJob};
 
 const MAX_HISTORY: usize = 200;
+const MIN_EDITOR_HEIGHT: f32 = 80.0;
+const MAX_EDITOR_HEIGHT: f32 = 600.0;
 const ADMIN_INSIGHTS: [(&str, &str); 4] = [
     (
         "Server activity",
@@ -317,11 +319,32 @@ impl SqlEditor {
         });
 
         ui.add_space(4.0);
+        let resize_handle = ui
+            .allocate_response(
+                egui::vec2(ui.available_width(), 8.0),
+                egui::Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+            .on_hover_text("Drag to resize the SQL editor");
+        if resize_handle.dragged() {
+            self.editor_height = resized_editor_height(self.editor_height, resize_handle.drag_delta().y);
+        }
+        let handle_color = if resize_handle.hovered() || resize_handle.dragged() {
+            ui.visuals().widgets.active.fg_stroke.color
+        } else {
+            ui.visuals().widgets.inactive.fg_stroke.color
+        };
+        ui.painter().line_segment(
+            [
+                egui::pos2(resize_handle.rect.left() + 6.0, resize_handle.rect.center().y),
+                egui::pos2(resize_handle.rect.right() - 6.0, resize_handle.rect.center().y),
+            ],
+            egui::Stroke::new(2.0_f32, handle_color),
+        );
         let completion_shortcut = ui.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Space));
         if completion_shortcut {
             self.show_completions = true;
         }
-        let available_width = ui.available_width();
         egui::Frame::none()
             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(60, 65, 75)))
             .rounding(4.0)
@@ -331,10 +354,11 @@ impl SqlEditor {
                     let job = highlight_sql(text, wrap_width);
                     ui.fonts(|fonts| fonts.layout_job(job))
                 };
-                ui.add(
+                ui.add_sized(
+                    egui::vec2(ui.available_width(), self.editor_height),
                     egui::TextEdit::multiline(&mut self.sql_text)
                         .font(egui::TextStyle::Monospace)
-                        .desired_width(available_width)
+                        .desired_width(f32::INFINITY)
                         .desired_rows(6)
                         .hint_text(
                             "-- Type SQL here. Ctrl+Space opens completion; Ctrl+Enter executes.",
@@ -433,6 +457,10 @@ impl SqlEditor {
     }
 }
 
+fn resized_editor_height(current_height: f32, delta: f32) -> f32 {
+    (current_height + delta).clamp(MIN_EDITOR_HEIGHT, MAX_EDITOR_HEIGHT)
+}
+
 fn prepare_query_plan(query: &str) -> Option<String> {
     let query = query.trim().trim_end_matches(';').trim();
     if query.is_empty() {
@@ -455,7 +483,7 @@ fn trailing_word(text: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ADMIN_INSIGHTS, prepare_query_plan};
+    use super::{ADMIN_INSIGHTS, prepare_query_plan, resized_editor_height};
 
     #[test]
     fn query_plan_does_not_execute_the_statement() {
@@ -473,6 +501,13 @@ mod tests {
         assert!(ADMIN_INSIGHTS[1].1.contains("pg_blocking_pids"));
         assert!(ADMIN_INSIGHTS[2].1.contains("pg_stat_database"));
         assert!(ADMIN_INSIGHTS[3].1.contains("pg_roles"));
+    }
+
+    #[test]
+    fn editor_height_resize_stays_within_bounds() {
+        assert_eq!(resized_editor_height(180.0, 40.0), 220.0);
+        assert_eq!(resized_editor_height(100.0, -50.0), 80.0);
+        assert_eq!(resized_editor_height(580.0, 50.0), 600.0);
     }
 }
 

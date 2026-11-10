@@ -107,6 +107,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 - **Schema DDL Forms**: Create indexes, foreign keys, CHECK/UNIQUE/PRIMARY KEY constraints, views, and sequences from object-browser context menus; inspect generated SQL previews before execution.
 - **Table Grants**: Grant or revoke table privileges for existing roles or `PUBLIC`, including grant option and revoke cascade controls, with a generated SQL preview.
 - **Activity Dashboard**: Monitor visible sessions, queries running at least five seconds, blocked sessions and lock waits, and the largest databases and tables. Refresh manually or automatically every 15 seconds while the dashboard is open.
+- **System Stats**: View host-level OS, CPU, memory, disk, load, process, and network metrics from the optional PostgreSQL `system_stats` extension in a dedicated tab. The extension must be installed on the PostgreSQL server and enabled in the selected database; pg-mini does not install server-side extensions. Access is controlled by the extension's `monitor_system_stats` role, and values may be `NULL` or unavailable depending on platform and permissions.
 
 - **Persistent Query History**: Keeps the latest 200 distinct queries in the app configuration, with search, load-into-editor, and copy actions.
 - **Error Reporting**: Clear, highlighted PostgreSQL error banners when syntax or constraints fail.
@@ -179,7 +180,7 @@ Build a Debian package (including the desktop launcher and lightning icon):
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./target/debian/pg-mini_0.1.11_amd64.deb
+sudo apt install ./target/debian/pg-mini_0.1.12_amd64.deb
 ```
 
 The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop application launcher, and installs the icon in the hicolor icon theme.
@@ -193,7 +194,7 @@ RPM packages are built on Rocky Linux 9 for x86_64 and target RHEL 9-compatible 
 On a supported distribution, install the downloaded package with:
 
 ```bash
-sudo dnf install ./pg-mini-0.1.10-1.el9.x86_64.rpm
+sudo dnf install ./pg-mini-0.1.12-1.el9.x86_64.rpm
 ```
 
 To build the RPM locally on a Rocky Linux 9-compatible build environment, install Rust, the Linux GUI development libraries, and `rpm-build`, then run:
@@ -208,15 +209,11 @@ The generated RPM is placed in `target/rpm/`.
 
 ## 🚀 Build Packages on GitHub
 
-<<<<<<< HEAD
-The GitHub Actions workflow builds the Ubuntu `.deb`, a RHEL-compatible `.rpm`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.10`):
-=======
-The GitHub Actions workflow builds the Ubuntu `.deb`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.11`):
->>>>>>> 52020801095c347d54a8efc73c0305ba50adf6a5
+The GitHub Actions workflow builds the Ubuntu `.deb`, a RHEL-compatible `.rpm`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.12`):
 
 ```bash
-git tag v0.1.11
-git push origin v0.1.11
+git tag v0.1.12
+git push origin v0.1.12
 ```
 
 Once all platform builds finish, GitHub publishes a Release with the Linux, Windows, and macOS downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.
@@ -232,6 +229,26 @@ Backup and restore call the PostgreSQL client utilities (`pg_dump`, `pg_restore`
 TLS mode **Prefer** attempts verified TLS first and falls back to plaintext if TLS negotiation fails; it does not retry in plaintext after the server returns a PostgreSQL error. Choose **Require** to prevent plaintext fallback. Both TLS modes validate the server certificate and hostname using the operating system trust store, augmented by the optional PEM CA certificate. Imported certificate paths are local paths and may need to be updated on the destination computer. Profile JSON exports omit passwords by default; password-inclusive exports contain credentials in plaintext and should be protected accordingly.
 
 The Activity dashboard is refreshed from PostgreSQL's statistics views and shows data visible to the connected database role; PostgreSQL may hide query text or other session details from non-privileged accounts.
+
+---
+
+## System Stats Extension
+
+The **System Stats** tab reads the [EnterpriseDB `system_stats` extension](https://github.com/EnterpriseDB/system_stats), which exposes operating-system metrics through PostgreSQL functions. It reports OS and CPU details, CPU usage, memory and swap, disk and I/O, load average, process counts and per-process CPU/memory, and network interfaces. The extension supports Linux, macOS, and Windows; some fields are platform-specific and are returned as `NULL` when unavailable.
+
+The extension is separate from pg-mini and must be installed on the PostgreSQL server using the extension build or package appropriate for that server. Then enable it in each database where host metrics should be monitored:
+
+```sql
+CREATE EXTENSION system_stats;
+```
+
+By default, the extension restricts function execution to superusers and members of `monitor_system_stats`. For least-privilege monitoring, grant that role to the account used by pg-mini after reviewing the extension's security guidance:
+
+```sql
+GRANT monitor_system_stats TO monitoring_user;
+```
+
+pg-mini only reads the extension's functions. It does not install, upgrade, or remove PostgreSQL extensions. The System Stats tab detects whether the extension is enabled in the current database, reports per-function permission errors, and preserves `NULL` values rather than presenting them as zero.
 
 ---
 
@@ -278,12 +295,14 @@ postgresql-manager/
     ├── main.rs           # Application entry point and window setup
     ├── app.rs            # Main eframe::App implementation and UI layout
     ├── ha/               # HA node roles and status models
+    ├── system_stats.rs   # system_stats extension query results
     ├── models.rs         # Data models (connections, query results, cells)
     ├── config.rs         # Persistent configuration (~/.config/pg-mini/)
     ├── db.rs             # Background Tokio worker & async tokio-postgres client
     └── ui/
         ├── mod.rs
         ├── ha_overview.rs      # HA node role overview
+        ├── system_stats.rs     # Optional host system statistics view
         ├── connection_modal.rs  # Connection dialog & profile manager
         ├── sidebar.rs           # Schema and table explorer
         ├── data_table.rs        # Virtualized table grid & CSV export
