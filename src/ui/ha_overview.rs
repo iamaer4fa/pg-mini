@@ -1,8 +1,10 @@
 use crate::ha::{
-    HaCluster, HaNode, NodeRole, PrimaryStandbyStatus, ReplicationStatus, WalReceiverStatus,
+    HaCluster, HaEventSeverity, HaMonitoringConfig, HaNode, HaStatusChange, NodeRole,
+    PrimaryStandbyStatus, ReplicationStatus, WalReceiverStatus,
 };
 use crate::models::ConnectionConfig;
 use egui::{Color32, RichText, Ui};
+use std::time::Duration;
 
 pub fn render_ha_overview(
     ui: &mut Ui,
@@ -10,6 +12,8 @@ pub fn render_ha_overview(
     saved_connections: &[ConnectionConfig],
     nodes: &[HaNode],
     is_busy: bool,
+    monitoring: &mut HaMonitoringConfig,
+    events: &std::collections::VecDeque<HaStatusChange>,
     new_cluster_name: &mut String,
     selected_connection: &mut Option<String>,
 ) -> (bool, bool) {
@@ -34,6 +38,56 @@ pub fn render_ha_overview(
         .color(Color32::GRAY),
     );
     ui.separator();
+
+    ui.collapsing("Monitoring settings", |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Refresh every");
+            let before = monitoring.refresh_interval_seconds;
+            ui.add(
+                egui::DragValue::new(&mut monitoring.refresh_interval_seconds)
+                    .range(5..=300)
+                    .suffix(" s"),
+            );
+            config_changed |= before != monitoring.refresh_interval_seconds;
+            ui.label("Mark stale after");
+            let before = monitoring.stale_after_seconds;
+            ui.add(
+                egui::DragValue::new(&mut monitoring.stale_after_seconds)
+                    .range(15..=3600)
+                    .suffix(" s"),
+            );
+            config_changed |= before != monitoring.stale_after_seconds;
+        });
+        ui.horizontal(|ui| {
+            let before = monitoring.alert_on_lag;
+            ui.checkbox(
+                &mut monitoring.alert_on_lag,
+                "Alert when reported lag exceeds",
+            );
+            config_changed |= before != monitoring.alert_on_lag;
+            let before = monitoring.lag_threshold_seconds;
+            ui.add_enabled(
+                monitoring.alert_on_lag,
+                egui::DragValue::new(&mut monitoring.lag_threshold_seconds)
+                    .range(0.1..=3600.0)
+                    .speed(0.5)
+                    .suffix(" s"),
+            );
+            config_changed |= before != monitoring.lag_threshold_seconds;
+        });
+        let before = monitoring.alert_on_status_check_failure;
+        ui.checkbox(
+            &mut monitoring.alert_on_status_check_failure,
+            "Record an alert when an HA status check fails",
+        );
+        config_changed |= before != monitoring.alert_on_status_check_failure;
+        monitoring.refresh_interval_seconds = monitoring.refresh_interval_seconds.clamp(5, 300);
+        monitoring.stale_after_seconds = monitoring.stale_after_seconds.clamp(15, 3600);
+        if !monitoring.lag_threshold_seconds.is_finite() {
+            monitoring.lag_threshold_seconds = 10.0;
+        }
+        monitoring.lag_threshold_seconds = monitoring.lag_threshold_seconds.clamp(0.1, 3600.0);
+    });
 
     ui.horizontal(|ui| {
         ui.label("New cluster:");
@@ -66,111 +120,110 @@ pub fn render_ha_overview(
         if saved_connections.is_empty() {
             ui.label("No saved connections are available.");
         }
-        return (refresh, config_changed);
-    }
-
-    egui::ScrollArea::vertical()
-        .auto_shrink([false; 2])
-        .show(ui, |ui| {
-            let mut remove_cluster = None;
-            let mut remove_node = None;
-            for cluster in clusters.iter_mut() {
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.heading(&cluster.name);
-                    if ui.small_button("Remove cluster").clicked() {
-                        remove_cluster = Some(cluster.id.clone());
-                    }
-                });
-
-                let available: Vec<_> = saved_connections
-                    .iter()
-                    .filter(|connection| !cluster.connection_ids.contains(&connection.id))
-                    .collect();
-                if !available.is_empty() {
-                    if selected_connection
-                        .as_ref()
-                        .is_none_or(|selected| !available.iter().any(|c| &c.id == selected))
-                    {
-                        *selected_connection = Some(available[0].id.clone());
-                    }
+    } else {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                let mut remove_cluster = None;
+                let mut remove_node = None;
+                for cluster in clusters.iter_mut() {
+                    ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        let selected_label = selected_connection
+                        ui.heading(&cluster.name);
+                        if ui.small_button("Remove cluster").clicked() {
+                            remove_cluster = Some(cluster.id.clone());
+                        }
+                    });
+
+                    let available: Vec<_> = saved_connections
+                        .iter()
+                        .filter(|connection| !cluster.connection_ids.contains(&connection.id))
+                        .collect();
+                    if !available.is_empty() {
+                        if selected_connection
                             .as_ref()
-                            .and_then(|id| available.iter().find(|c| &c.id == id))
-                            .map(|connection| connection.name.as_str())
-                            .unwrap_or("Select saved connection");
-                        egui::ComboBox::from_id_salt(("ha_cluster_connection", &cluster.id))
-                            .selected_text(selected_label)
-                            .show_ui(ui, |ui| {
-                                for connection in &available {
-                                    ui.selectable_value(
-                                        selected_connection,
-                                        Some(connection.id.clone()),
-                                        &connection.name,
-                                    );
-                                }
-                            });
-                        if ui.button("Add node").clicked() {
-                            if let Some(connection_id) = selected_connection.clone() {
-                                if available
-                                    .iter()
-                                    .any(|connection| connection.id == connection_id)
-                                {
-                                    cluster.connection_ids.push(connection_id);
-                                    config_changed = true;
+                            .is_none_or(|selected| !available.iter().any(|c| &c.id == selected))
+                        {
+                            *selected_connection = Some(available[0].id.clone());
+                        }
+                        ui.horizontal(|ui| {
+                            let selected_label = selected_connection
+                                .as_ref()
+                                .and_then(|id| available.iter().find(|c| &c.id == id))
+                                .map(|connection| connection.name.as_str())
+                                .unwrap_or("Select saved connection");
+                            egui::ComboBox::from_id_salt(("ha_cluster_connection", &cluster.id))
+                                .selected_text(selected_label)
+                                .show_ui(ui, |ui| {
+                                    for connection in &available {
+                                        ui.selectable_value(
+                                            selected_connection,
+                                            Some(connection.id.clone()),
+                                            &connection.name,
+                                        );
+                                    }
+                                });
+                            if ui.button("Add node").clicked() {
+                                if let Some(connection_id) = selected_connection.clone() {
+                                    if available
+                                        .iter()
+                                        .any(|connection| connection.id == connection_id)
+                                    {
+                                        cluster.connection_ids.push(connection_id);
+                                        config_changed = true;
+                                    }
                                 }
                             }
-                        }
-                    });
-                } else {
-                    ui.label(
-                        RichText::new("All saved connections are already in this cluster.")
-                            .small()
-                            .color(Color32::GRAY),
-                    );
-                }
-
-                if cluster.connection_ids.is_empty() {
-                    ui.label("No nodes have been associated with this cluster.");
-                }
-                for connection_id in &cluster.connection_ids {
-                    if let Some(node) = nodes
-                        .iter()
-                        .find(|node| &node.connection_id == connection_id)
-                    {
-                        render_node(ui, node);
-                    } else if let Some(connection) = saved_connections
-                        .iter()
-                        .find(|connection| &connection.id == connection_id)
-                    {
-                        ui.label(format!(
-                            "{} — connection profile unavailable",
-                            connection.name
-                        ));
+                        });
+                    } else {
+                        ui.label(
+                            RichText::new("All saved connections are already in this cluster.")
+                                .small()
+                                .color(Color32::GRAY),
+                        );
                     }
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Remove node").clicked() {
-                            remove_node = Some((cluster.id.clone(), connection_id.clone()));
+
+                    if cluster.connection_ids.is_empty() {
+                        ui.label("No nodes have been associated with this cluster.");
+                    }
+                    for connection_id in &cluster.connection_ids {
+                        if let Some(node) = nodes
+                            .iter()
+                            .find(|node| &node.connection_id == connection_id)
+                        {
+                            render_node(ui, node, monitoring.stale_after_seconds);
+                        } else if let Some(connection) = saved_connections
+                            .iter()
+                            .find(|connection| &connection.id == connection_id)
+                        {
+                            ui.label(format!(
+                                "{} — connection profile unavailable",
+                                connection.name
+                            ));
                         }
-                    });
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Remove node").clicked() {
+                                remove_node = Some((cluster.id.clone(), connection_id.clone()));
+                            }
+                        });
+                    }
+
+                    render_relationships(ui, cluster, nodes, monitoring.stale_after_seconds);
+                    ui.separator();
                 }
 
-                render_relationships(ui, cluster, nodes);
-                ui.separator();
-            }
-
-            if let Some(cluster_id) = remove_cluster {
-                clusters.retain(|cluster| cluster.id != cluster_id);
-                config_changed = true;
-            }
-            if let Some((cluster_id, connection_id)) = remove_node {
-                if let Some(cluster) = clusters.iter_mut().find(|c| c.id == cluster_id) {
-                    cluster.connection_ids.retain(|id| id != &connection_id);
+                if let Some(cluster_id) = remove_cluster {
+                    clusters.retain(|cluster| cluster.id != cluster_id);
                     config_changed = true;
                 }
-            }
-        });
+                if let Some((cluster_id, connection_id)) = remove_node {
+                    if let Some(cluster) = clusters.iter_mut().find(|c| c.id == cluster_id) {
+                        cluster.connection_ids.retain(|id| id != &connection_id);
+                        config_changed = true;
+                    }
+                }
+            });
+    }
 
     ui.label(
         RichText::new(
@@ -179,25 +232,64 @@ pub fn render_ha_overview(
         .small()
         .color(Color32::GRAY),
     );
+    ui.separator();
+    ui.label(RichText::new("Recent status changes").strong());
+    if events.is_empty() {
+        ui.label(RichText::new("No status changes recorded this session.").color(Color32::GRAY));
+    } else {
+        for event in events.iter().take(20) {
+            let color = match event.severity {
+                HaEventSeverity::Info => Color32::LIGHT_BLUE,
+                HaEventSeverity::Warning => Color32::YELLOW,
+                HaEventSeverity::Critical => Color32::LIGHT_RED,
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{}s ago", event.occurred_at.elapsed().as_secs()))
+                        .small()
+                        .color(Color32::GRAY),
+                );
+                ui.label(RichText::new(&event.message).color(color));
+            });
+        }
+    }
+    ui.label(
+        RichText::new(
+            "pg-mini is a desktop monitor. These alerts and history are available only while the application is running and are not a substitute for server-side monitoring.",
+        )
+        .small()
+        .color(Color32::GRAY),
+    );
     (refresh, config_changed)
 }
 
-fn render_node(ui: &mut Ui, node: &HaNode) {
+fn render_node(ui: &mut Ui, node: &HaNode, stale_after_seconds: u64) {
     ui.group(|ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new(&node.name).strong());
             ui.label(format!("{} / {}", node.host_port, node.database));
-            if node.is_connected {
+            if node.is_connected && node.error.is_none() {
                 ui.label(RichText::new("Connected").color(Color32::LIGHT_GREEN));
+            } else if node.is_connected {
+                ui.label(RichText::new("Status check failed").color(Color32::YELLOW));
             } else {
                 ui.label(RichText::new("Not connected").color(Color32::GRAY));
             }
             if let Some(updated) = node.last_updated {
-                ui.label(
-                    RichText::new(format!("Updated {}s ago", updated.elapsed().as_secs()))
-                        .small()
-                        .color(Color32::GRAY),
-                );
+                let age = updated.elapsed();
+                if age >= Duration::from_secs(stale_after_seconds) {
+                    ui.label(
+                        RichText::new(format!("STALE — updated {}s ago", age.as_secs()))
+                            .small()
+                            .color(Color32::YELLOW),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(format!("Updated {}s ago", age.as_secs()))
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                }
             } else if node.is_refreshing {
                 ui.label(RichText::new("Checking...").small().color(Color32::YELLOW));
             } else {
@@ -256,12 +348,28 @@ fn render_node(ui: &mut Ui, node: &HaNode) {
     });
 }
 
-fn render_relationships(ui: &mut Ui, cluster: &HaCluster, nodes: &[HaNode]) {
+fn render_relationships(
+    ui: &mut Ui,
+    cluster: &HaCluster,
+    nodes: &[HaNode],
+    stale_after_seconds: u64,
+) {
     ui.label(RichText::new("Topology").strong());
-    let members: Vec<_> = cluster
+    let configured_members: Vec<_> = cluster
         .connection_ids
         .iter()
         .filter_map(|id| nodes.iter().find(|node| &node.connection_id == id))
+        .collect();
+    let members: Vec<_> = configured_members
+        .iter()
+        .copied()
+        .filter(|node| {
+            node.is_connected
+                && node.error.is_none()
+                && node.last_updated.is_some_and(|updated| {
+                    updated.elapsed() < Duration::from_secs(stale_after_seconds)
+                })
+        })
         .collect();
     let primaries: Vec<_> = members
         .iter()
@@ -283,7 +391,18 @@ fn render_relationships(ui: &mut Ui, cluster: &HaCluster, nodes: &[HaNode]) {
         .collect();
 
     if standbys.is_empty() {
-        ui.label("No connected standby is currently identified.");
+        let configured_standbys = configured_members.iter().any(|node| {
+            node.status
+                .as_ref()
+                .is_some_and(|status| status.role == NodeRole::Standby)
+        });
+        if configured_standbys {
+            ui.label(
+                "Standby topology is stale or disconnected; current relationship is unverified.",
+            );
+        } else {
+            ui.label("No connected standby is currently identified.");
+        }
         return;
     }
     for standby in standbys {

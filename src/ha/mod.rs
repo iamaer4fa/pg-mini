@@ -4,6 +4,42 @@ pub enum NodeRole {
     Standby,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HaMonitoringConfig {
+    pub refresh_interval_seconds: u64,
+    pub stale_after_seconds: u64,
+    pub lag_threshold_seconds: f64,
+    pub alert_on_lag: bool,
+    pub alert_on_status_check_failure: bool,
+}
+
+impl Default for HaMonitoringConfig {
+    fn default() -> Self {
+        Self {
+            refresh_interval_seconds: 15,
+            stale_after_seconds: 45,
+            lag_threshold_seconds: 10.0,
+            alert_on_lag: false,
+            alert_on_status_check_failure: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HaEventSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone)]
+pub struct HaStatusChange {
+    pub occurred_at: Instant,
+    pub severity: HaEventSeverity,
+    pub message: String,
+}
+
 impl NodeRole {
     pub fn label(self) -> &'static str {
         match self {
@@ -137,6 +173,8 @@ mod tests {
         let config: crate::models::AppConfig =
             serde_json::from_str(r#"{"saved_connections":[],"last_connection_id":null}"#).unwrap();
         assert!(config.ha_clusters.is_empty());
+        assert_eq!(config.ha_monitoring.refresh_interval_seconds, 15);
+        assert_eq!(config.ha_monitoring.stale_after_seconds, 45);
 
         let cluster = HaCluster {
             id: "cluster-1".to_string(),
@@ -147,3 +185,4 @@ mod tests {
     }
 }
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
