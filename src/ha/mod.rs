@@ -1,7 +1,46 @@
+use serde::{Deserialize, Serialize};
+use std::time::Instant;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRole {
     Primary,
     Standby,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrimaryLsnFields {
+    pub sent: &'static str,
+    pub written: &'static str,
+    pub flushed: &'static str,
+    pub replayed: &'static str,
+}
+
+pub fn primary_lsn_fields(server_version_num: i32) -> PrimaryLsnFields {
+    if server_version_num >= 100000 {
+        PrimaryLsnFields {
+            sent: "sent_lsn",
+            written: "write_lsn",
+            flushed: "flush_lsn",
+            replayed: "replay_lsn",
+        }
+    } else {
+        PrimaryLsnFields {
+            sent: "sent_location",
+            written: "write_location",
+            flushed: "flush_location",
+            replayed: "replay_location",
+        }
+    }
+}
+
+pub fn standby_replay_lsn_function(server_version_num: i32) -> Option<&'static str> {
+    if server_version_num < 90600 {
+        None
+    } else if server_version_num >= 100000 {
+        Some("pg_catalog.pg_last_wal_replay_lsn()")
+    } else {
+        Some("pg_catalog.pg_last_xlog_replay_location()")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -183,6 +222,32 @@ mod tests {
         };
         assert_eq!(cluster.connection_ids, ["primary"]);
     }
+
+    #[test]
+    fn primary_lsn_field_names_follow_postgresql_major_version() {
+        let legacy = super::primary_lsn_fields(90624);
+        assert_eq!(legacy.sent, "sent_location");
+        assert_eq!(legacy.written, "write_location");
+        assert_eq!(legacy.flushed, "flush_location");
+        assert_eq!(legacy.replayed, "replay_location");
+
+        let modern = super::primary_lsn_fields(100000);
+        assert_eq!(modern.sent, "sent_lsn");
+        assert_eq!(modern.written, "write_lsn");
+        assert_eq!(modern.flushed, "flush_lsn");
+        assert_eq!(modern.replayed, "replay_lsn");
+    }
+
+    #[test]
+    fn standby_replay_function_handles_unsupported_and_renamed_api() {
+        assert_eq!(super::standby_replay_lsn_function(90525), None);
+        assert_eq!(
+            super::standby_replay_lsn_function(90624),
+            Some("pg_catalog.pg_last_xlog_replay_location()")
+        );
+        assert_eq!(
+            super::standby_replay_lsn_function(100000),
+            Some("pg_catalog.pg_last_wal_replay_lsn()")
+        );
+    }
 }
-use serde::{Deserialize, Serialize};
-use std::time::Instant;

@@ -798,6 +798,12 @@ impl DbWorker {
 }
 
 async fn fetch_ha_status_impl(client: &Client) -> Result<HaNodeStatus, String> {
+    let server_version_num: i32 = client
+        .query_one("SELECT current_setting('server_version_num')::integer", &[])
+        .await
+        .map_err(|error| format!("Could not read PostgreSQL server version: {error}"))?
+        .try_get(0)
+        .map_err(|error| format!("Could not parse PostgreSQL server version: {error}"))?;
     let row = client
         .query_one("SELECT pg_catalog.pg_is_in_recovery()", &[])
         .await
@@ -806,14 +812,18 @@ async fn fetch_ha_status_impl(client: &Client) -> Result<HaNodeStatus, String> {
         .try_get(0)
         .map_err(|error| format!("Could not read PostgreSQL node role: {error}"))?;
     let role = NodeRole::from_recovery_state(is_in_recovery);
-    let system_identifier = client
-        .query_one(
-            "SELECT system_identifier::text FROM pg_catalog.pg_control_system()",
-            &[],
-        )
-        .await
-        .and_then(|row| row.try_get::<_, String>(0))
-        .map_err(|error| error.to_string());
+    let system_identifier = if server_version_num >= 100000 {
+        client
+            .query_one(
+                "SELECT system_identifier::text FROM pg_catalog.pg_control_system()",
+                &[],
+            )
+            .await
+            .and_then(|row| row.try_get::<_, String>(0))
+            .map_err(|error| error.to_string())
+    } else {
+        Err("System identifier query requires PostgreSQL 10 or later".to_string())
+    };
     let (system_identifier, system_identifier_error) = match system_identifier {
         Ok(identifier) => (Some(identifier), None),
         Err(error) => (
@@ -821,14 +831,8 @@ async fn fetch_ha_status_impl(client: &Client) -> Result<HaNodeStatus, String> {
             Some(format!("System identifier unavailable: {error}")),
         ),
     };
-    let server_version_num: i32 = client
-        .query_one("SELECT current_setting('server_version_num')::integer", &[])
-        .await
-        .map_err(|error| format!("Could not read PostgreSQL server version: {error}"))?
-        .try_get(0)
-        .map_err(|error| format!("Could not parse PostgreSQL server version: {error}"))?;
     let replication = match role {
-        NodeRole::Primary => fetch_primary_replication_status(client).await,
+        NodeRole::Primary => fetch_primary_replication_status(client, server_version_num).await,
         NodeRole::Standby => fetch_standby_replication_status(client, server_version_num).await,
     }
     .unwrap_or_else(|reason| ReplicationStatus::Unknown { reason });
@@ -840,23 +844,31 @@ async fn fetch_ha_status_impl(client: &Client) -> Result<HaNodeStatus, String> {
     })
 }
 
-async fn fetch_primary_replication_status(client: &Client) -> Result<ReplicationStatus, String> {
+async fn fetch_primary_replication_status(
+    client: &Client,
+    server_version_num: i32,
+) -> Result<ReplicationStatus, String> {
+    let fields = crate::ha::primary_lsn_fields(server_version_num);
     let rows = client
-        .simple_query(
+        .simple_query(&format!(
             "SELECT to_jsonb(replication)->>'application_name', \
              to_jsonb(replication)->>'client_addr', \
              to_jsonb(replication)->>'state', \
              to_jsonb(replication)->>'sync_state', \
-             to_jsonb(replication)->>'sent_lsn', \
-             to_jsonb(replication)->>'write_lsn', \
-             to_jsonb(replication)->>'flush_lsn', \
-             to_jsonb(replication)->>'replay_lsn', \
+             to_jsonb(replication)->>'{sent}', \
+             to_jsonb(replication)->>'{written}', \
+             to_jsonb(replication)->>'{flushed}', \
+             to_jsonb(replication)->>'{replayed}', \
              extract(epoch FROM NULLIF(to_jsonb(replication)->>'write_lag', '')::interval)::text, \
              extract(epoch FROM NULLIF(to_jsonb(replication)->>'flush_lag', '')::interval)::text, \
              extract(epoch FROM NULLIF(to_jsonb(replication)->>'replay_lag', '')::interval)::text \
              FROM pg_catalog.pg_stat_replication AS replication \
              ORDER BY to_jsonb(replication)->>'application_name';",
-        )
+            sent = fields.sent,
+            written = fields.written,
+            flushed = fields.flushed,
+            replayed = fields.replayed,
+        ))
         .await
         .map_err(|error| format!("Failed to fetch primary replication status: {error}"))?;
 
@@ -888,11 +900,8 @@ async fn fetch_standby_replication_status(
     if server_version_num < 90600 {
         return Err("WAL receiver statistics require PostgreSQL 9.6 or later".to_string());
     }
-    let replay_lsn_function = if server_version_num >= 100000 {
-        "pg_catalog.pg_last_wal_replay_lsn()"
-    } else {
-        "pg_catalog.pg_last_xlog_replay_location()"
-    };
+    let replay_lsn_function = crate::ha::standby_replay_lsn_function(server_version_num)
+        .ok_or_else(|| "WAL receiver statistics require PostgreSQL 9.6 or later".to_string())?;
     let rows = client
         .simple_query(&format!(
             "SELECT to_jsonb(receiver)->>'status', \
@@ -939,7 +948,11 @@ fn parse_optional_ha_f64(
     index: usize,
     label: &str,
 ) -> Result<Option<f64>, String> {
-    row.get(index)
+    parse_ha_f64(row.get(index), label)
+}
+
+fn parse_ha_f64(value: Option<&str>, label: &str) -> Result<Option<f64>, String> {
+    value
         .map(|value| {
             value
                 .parse::<f64>()
@@ -1549,7 +1562,7 @@ async fn save_role_impl(client: &Client, form: &RoleForm) -> Result<(), String> 
 
 #[cfg(test)]
 mod db_tests {
-    use super::{is_plain_sql_backup, role_sql_preview};
+    use super::{is_plain_sql_backup, parse_ha_f64, role_sql_preview};
     use crate::models::RoleForm;
     use std::path::Path;
 
@@ -1600,6 +1613,14 @@ mod db_tests {
         let sql = role_sql_preview(&form).unwrap();
         assert!(sql.contains("GRANT \"new_group\" TO \"app_user\";"));
         assert!(sql.contains("REVOKE \"old_group\" FROM \"app_user\";"));
+    }
+
+    #[test]
+    fn optional_replication_lag_preserves_unknown_and_zero_values() {
+        assert_eq!(parse_ha_f64(None, "write lag").unwrap(), None);
+        assert_eq!(parse_ha_f64(Some("0"), "write lag").unwrap(), Some(0.0));
+        assert_eq!(parse_ha_f64(Some("1.25"), "write lag").unwrap(), Some(1.25));
+        assert!(parse_ha_f64(Some("unknown"), "write lag").is_err());
     }
 }
 
