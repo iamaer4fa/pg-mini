@@ -5,6 +5,7 @@ use egui::{Color32, Key, RichText, ScrollArea, Ui, text::LayoutJob};
 const MAX_HISTORY: usize = 200;
 const MIN_EDITOR_HEIGHT: f32 = 80.0;
 const MAX_EDITOR_HEIGHT: f32 = 600.0;
+const ERROR_FOOTER_HEIGHT: f32 = 120.0;
 const ADMIN_INSIGHTS: [(&str, &str); 4] = [
     (
         "Server activity",
@@ -195,6 +196,24 @@ impl SqlEditor {
             });
         }
 
+        let query_error = last_result
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .cloned();
+        let available_size = ui.available_size();
+        let error_footer_height = query_error
+            .as_ref()
+            .map(|_| available_size.y.min(ERROR_FOOTER_HEIGHT))
+            .unwrap_or(0.0);
+        let content_height = (available_size.y - error_footer_height).max(0.0);
+
+        ScrollArea::vertical()
+            .id_salt("sql_editor_content")
+            .max_width(available_size.x)
+            .max_height(content_height)
+            .auto_shrink([true, false])
+            .show(ui, |ui| {
+                ui.set_min_width(available_size.x);
         let has_more_rows = last_result
             .as_ref()
             .and_then(|result| result.as_ref().ok())
@@ -413,21 +432,30 @@ impl SqlEditor {
             .rounding(4.0)
             .inner_margin(4.0)
             .show(ui, |ui| {
-                let mut layouter = |ui: &Ui, text: &str, wrap_width: f32| {
-                    let job = highlight_sql(text, wrap_width);
+                let mut layouter = |ui: &Ui, text: &str, _wrap_width: f32| {
+                    let job = highlight_sql(text, f32::INFINITY);
                     ui.fonts(|fonts| fonts.layout_job(job))
                 };
-                ui.add_sized(
-                    egui::vec2(ui.available_width(), self.editor_height),
-                    egui::TextEdit::multiline(&mut self.sql_text)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(6)
-                        .hint_text(
-                            "-- Type SQL here. Ctrl+Space opens completion; Ctrl+Enter executes.",
-                        )
-                        .layouter(&mut layouter),
-                );
+                ScrollArea::both()
+                    .id_salt("sql_editor_text")
+                    .max_width(ui.available_width())
+                    .max_height(self.editor_height)
+                    .auto_shrink([false; 2])
+                    .scroll_bar_visibility(
+                        egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                    )
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.sql_text)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(6)
+                                .hint_text(
+                                    "-- Type SQL here. Ctrl+Space opens completion; Ctrl+Enter executes.",
+                                )
+                                .layouter(&mut layouter),
+                        );
+                    });
             });
 
         let resize_handle = ui
@@ -512,28 +540,7 @@ impl SqlEditor {
                     }
                 }
             }
-            Some(Err(err)) => {
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(50, 15, 15))
-                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(220, 50, 50)))
-                    .rounding(6.0)
-                    .inner_margin(12.0)
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new("❌ Query Execution Error")
-                                .color(Color32::LIGHT_RED)
-                                .strong()
-                                .size(15.0),
-                        );
-                        ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                            ui.label(
-                                RichText::new(err)
-                                    .monospace()
-                                    .color(Color32::from_rgb(255, 180, 180)),
-                            );
-                        });
-                    });
-            }
+            Some(Err(_)) => {}
             None => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(30.0);
@@ -544,6 +551,15 @@ impl SqlEditor {
                     );
                 });
             }
+        }
+            });
+
+        if let Some(error) = query_error {
+            ui.allocate_ui_with_layout(
+                egui::vec2(available_size.x, error_footer_height),
+                egui::Layout::bottom_up(egui::Align::Min),
+                |ui| render_query_error(ui, &error),
+            );
         }
         action
     }
@@ -559,6 +575,29 @@ impl SqlEditor {
 
 fn resized_editor_height(current_height: f32, delta: f32) -> f32 {
     (current_height + delta).clamp(MIN_EDITOR_HEIGHT, MAX_EDITOR_HEIGHT)
+}
+
+fn render_query_error(ui: &mut Ui, error: &str) {
+    egui::Frame::none()
+        .fill(Color32::from_rgb(50, 15, 15))
+        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(220, 50, 50)))
+        .rounding(6.0)
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new("❌ Query Execution Error")
+                    .color(Color32::LIGHT_RED)
+                    .strong()
+                    .size(15.0),
+            );
+            ScrollArea::vertical().max_height(72.0).show(ui, |ui| {
+                ui.label(
+                    RichText::new(error)
+                        .monospace()
+                        .color(Color32::from_rgb(255, 180, 180)),
+                );
+            });
+        });
 }
 
 fn prepare_query_plan(query: &str) -> Option<String> {
