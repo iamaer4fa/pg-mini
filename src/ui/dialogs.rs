@@ -642,10 +642,6 @@ pub fn render_confirm_dialog(
             ui.set_min_width(400.0);
 
             ui.horizontal(|ui| {
-                let is_restore = matches!(
-                    state.action.as_ref(),
-                    Some(crate::models::ConfirmAction::RestoreDatabase { .. })
-                );
                 let is_sql_review = matches!(
                     state.action.as_ref(),
                     Some(
@@ -653,9 +649,7 @@ pub fn render_confirm_dialog(
                             | crate::models::ConfirmAction::ExecuteDdl(_)
                     )
                 );
-                ui.label(RichText::new(if is_restore {
-                    "⚠ Confirm Restore"
-                } else if is_sql_review {
+                ui.label(RichText::new(if is_sql_review {
                     "⚠ Review SQL"
                 } else {
                     "⚠ Warning"
@@ -678,10 +672,6 @@ pub fn render_confirm_dialog(
                     });
                 });
             }
-            let is_restore = matches!(
-                state.action.as_ref(),
-                Some(crate::models::ConfirmAction::RestoreDatabase { .. })
-            );
             let is_sql_review = matches!(
                 state.action.as_ref(),
                 Some(
@@ -696,9 +686,7 @@ pub fn render_confirm_dialog(
                         | crate::models::ConfirmAction::SwitchDatabaseWithOpenTransaction { .. }
                 )
             );
-            ui.label(RichText::new(if is_restore {
-                "Restoring may permanently change or delete database data."
-            } else if is_sql_review {
+            ui.label(RichText::new(if is_sql_review {
                 "Confirm the target and SQL before execution. The database may apply only part of a multi-statement script if an error occurs."
             } else if is_session_change {
                 "Uncommitted changes will be rolled back when the PostgreSQL session closes."
@@ -716,10 +704,6 @@ pub fn render_confirm_dialog(
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let is_restore = matches!(
-                        state.action.as_ref(),
-                        Some(crate::models::ConfirmAction::RestoreDatabase { .. })
-                    );
                     let is_sql_review = matches!(
                         state.action.as_ref(),
                         Some(
@@ -736,9 +720,7 @@ pub fn render_confirm_dialog(
                     );
                     let confirm_btn = ui.add_enabled(
                         !is_busy,
-                        egui::Button::new(RichText::new(if is_restore {
-                            "Restore Database"
-                        } else if is_sql_review {
+                        egui::Button::new(RichText::new(if is_sql_review {
                             "Execute SQL"
                         } else if is_session_change {
                             "Continue (roll back)"
@@ -746,7 +728,7 @@ pub fn render_confirm_dialog(
                             "Yes, Delete"
                         })
                             .strong().color(Color32::WHITE))
-                            .fill(if is_restore { Color32::from_rgb(16, 145, 90) } else { Color32::from_rgb(185, 35, 35) })
+                            .fill(Color32::from_rgb(185, 35, 35))
                             .rounding(egui::Rounding::same(6.0)),
                     );
 

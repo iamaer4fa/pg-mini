@@ -1,4 +1,5 @@
 pub mod activity_view;
+pub mod backup_restore;
 pub mod columns_view;
 pub mod connection_modal;
 pub mod data_table;

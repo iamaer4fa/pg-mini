@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -132,6 +133,25 @@ pub struct QueryResult {
     pub execution_time_ms: f64,
     pub is_select: bool,
     pub has_more_rows: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestoreArchiveEntry {
+    pub line: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackupRestorePreflight {
+    pub tool: String,
+    pub tool_version: String,
+    pub server_version: String,
+    pub target_database: String,
+    pub format: String,
+    pub command_preview: String,
+    pub database_size_bytes: Option<u64>,
+    pub available_space_bytes: Option<u64>,
+    pub restore_entries: Arc<Vec<RestoreArchiveEntry>>,
+    pub warnings: Vec<String>,
 }
 
 impl QueryResult {
@@ -611,10 +631,6 @@ pub enum ConfirmAction {
     },
     DropRole {
         role_name: String,
-    },
-    RestoreDatabase {
-        db_name: String,
-        file_path: std::path::PathBuf,
     },
     ExecuteSql {
         sql: String,

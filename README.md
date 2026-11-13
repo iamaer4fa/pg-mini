@@ -45,7 +45,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
   - `⚡ Open Query Tool`: Opens SQL Editor targeting this database.
   - `➕ Create Table...`: Launches a quick table creation modal.
   - `🔄 Refresh Tables`: Reloads schema objects.
-  - `Backup...` / `Restore...`: Save custom-format database backups and restore PostgreSQL archives or plain SQL scripts.
+  - `Backup...` / `Restore...`: Preflight client tools and destination access, inspect archive contents, review clean/object-selection options, and monitor tool output and elapsed time.
   - `🗑️ Drop Database...`: Drops the database with confirmation (protected against dropping active DB).
 - **Multiple Live Servers**: Connect to several PostgreSQL servers at once, switch the active server from the top bar, and keep each server connected while working with another.
 - **Profile Management**: Save and switch between multiple PostgreSQL connection profiles (Host, Port, Database, Username, Password).
@@ -228,7 +228,22 @@ To keep multiple PostgreSQL servers connected, choose **➕ Connect Server** and
 
 On macOS, download the matching `arm64` (Apple silicon) or `x64` (Intel) `.dmg` from the GitHub Release, open it, and drag **pg-mini** into **Applications**. The app is currently unsigned and not notarized, so macOS may require you to allow it in **System Settings → Privacy & Security** the first time it is opened.
 
-Backup and restore call the PostgreSQL client utilities (`pg_dump`, `pg_restore`, or `psql`) installed on your computer. Install PostgreSQL command-line tools separately and make sure their `bin` directory is on `PATH`. Backups are custom-format `.dump` files; restore also accepts PostgreSQL custom/tar archives and plain `.sql` files. Restore does not use `pg_restore --clean`, but SQL files and archive contents can still change or drop database objects.
+Backup and restore call the PostgreSQL client utilities (`pg_dump`, `pg_restore`, or `psql`) installed on your computer. Install PostgreSQL command-line tools separately and make sure their `bin` directory is on `PATH`. Backups are custom-format `.dump` files; restore also accepts PostgreSQL custom/tar archives and plain `.sql` files. Before running, pg-mini checks the selected tool version, target database access, and backup destination access. It reports database and available disk sizes when accessible; free space on the PostgreSQL server cannot be determined remotely. Backup files are never overwritten and are created with owner-only permissions on Unix-like systems. Verbose client-tool output, completion status, elapsed time, and actionable error output remain visible in the operation window. Restores use `ON_ERROR_STOP`/`--exit-on-error`, but a failure can still leave partial changes.
+
+For archive restores, review the target server/database and the archive entries before confirming. **Clean before restore** passes `pg_restore --clean --if-exists` and drops the selected existing objects before recreating them; it does not mean “empty the entire database.” Object selection is available for PostgreSQL archives, not plain SQL scripts. Selecting related table/schema/data entries may be necessary. Plain SQL restore has no clean or object-selection option; use an empty disposable database when possible. The command preview omits the password, which is supplied through the PostgreSQL client environment. For profiles using TLS mode **Prefer**, external client tools require verified TLS and do not fall back to plaintext; pg-mini calls out this difference during preflight.
+
+#### Manual backup-and-restore verification
+
+Use a disposable PostgreSQL server and database, never a production target:
+
+1. Create a test database and a small table with known rows, then record a check such as `SELECT count(*) FROM public.backup_check;`.
+2. In pg-mini, choose **Backup...**, save to a new `.dump` path, review the preflight tool/version, target, destination space, and command, then start the backup. Confirm the operation reports completion and elapsed time.
+3. Create a second, empty test database. Choose **Restore...** on that database, select the dump, inspect the archive list, leave **Clean** off, select the needed entries, and confirm the restore.
+4. Run the same row-count query against the second database and compare it with the original. Also inspect the operation window for tool output and warnings.
+5. To verify clean behavior, use another disposable database containing a known conflicting object, select the corresponding archive entries, enable **Clean**, and confirm only those selected objects are dropped/recreated. Verify the resulting schema and data.
+6. Optionally select a plain `.sql` dump and verify that the UI explains that clean and object selection are unavailable. Restore SQL scripts only into an empty or otherwise reviewed target.
+
+Keep the backup files until the restored schema and data have been checked. A successful tool exit is not a substitute for application-level restore verification.
 
 TLS mode **Prefer** attempts verified TLS first and falls back to plaintext if TLS negotiation fails; it does not retry in plaintext after the server returns a PostgreSQL error. Choose **Require** to prevent plaintext fallback. Both TLS modes validate the server certificate and hostname using the operating system trust store, augmented by the optional PEM CA certificate. Imported certificate paths are local paths and may need to be updated on the destination computer. Profile JSON exports omit passwords by default; password-inclusive exports contain credentials in plaintext and should be protected accordingly.
 

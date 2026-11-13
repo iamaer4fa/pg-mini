@@ -1,11 +1,13 @@
 use futures_util::TryStreamExt;
+use std::collections::VecDeque;
 use std::future::Future;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader, Write};
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
 use std::{
-    path::Path,
+    fs::{self, File, OpenOptions},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 use tokio::sync::watch;
@@ -17,9 +19,9 @@ use crate::ha::{
     HaNodeStatus, NodeRole, PrimaryStandbyStatus, ReplicationStatus, WalReceiverStatus,
 };
 use crate::models::{
-    AddColumnForm, CellValue, ColumnItem, ConnectionConfig, CreateTableForm, DatabaseItem,
-    DbObjectItem, DbObjectKind, DbObjectRef, EditableCell, ObjectTreeKey, QueryResult, RoleForm,
-    RoleItem, TableItem, TlsMode,
+    AddColumnForm, BackupRestorePreflight, CellValue, ColumnItem, ConnectionConfig,
+    CreateTableForm, DatabaseItem, DbObjectItem, DbObjectKind, DbObjectRef, EditableCell,
+    ObjectTreeKey, QueryResult, RestoreArchiveEntry, RoleForm, RoleItem, TableItem, TlsMode,
 };
 use crate::sql_safety::{
     transaction_state_after, transaction_state_after_error, validate_read_only_sql,
@@ -87,13 +89,23 @@ pub enum DbRequest {
     DropDatabase {
         db_name: String,
     },
-    BackupDatabase {
+    PreflightBackup {
         db_name: String,
         file_path: std::path::PathBuf,
     },
-    RestoreDatabase {
+    PreflightRestore {
         db_name: String,
         file_path: std::path::PathBuf,
+    },
+    RunBackup {
+        db_name: String,
+        file_path: PathBuf,
+    },
+    RunRestore {
+        db_name: String,
+        file_path: PathBuf,
+        clean_before_restore: bool,
+        selected_entries: Vec<String>,
     },
     DropObject(DbObjectRef),
     RenameObject {
@@ -148,6 +160,13 @@ pub enum DbResponse {
     ProvisioningPreflightFetched {
         connection_id: String,
         result: Result<ProvisioningPreflight, String>,
+    },
+    BackupRestorePreflight(Result<BackupRestorePreflight, String>),
+    BackupRestoreProgress(String),
+    BackupRestoreFinished {
+        database: String,
+        is_restore: bool,
+        result: Result<String, String>,
     },
     HaStatusFetched(Result<HaNodeStatus, String>),
     SchemasFetched {
@@ -1025,61 +1044,81 @@ impl DbWorker {
                                     let _ = res_tx.send(DbResponse::Busy(false));
                                 }
                             }
-                            DbRequest::BackupDatabase { db_name, file_path } => {
-                                if let Some(cfg) = &current_cfg {
-                                    let _ = res_tx.send(DbResponse::Busy(true));
-                                    match backup_database(cfg, &db_name, &file_path) {
-                                        Ok(()) => {
-                                            let _ = res_tx.send(DbResponse::OperationSuccess {
-                                                message: format!(
-                                                    "Database '{}' backed up to {}",
-                                                    db_name,
-                                                    file_path.display()
-                                                ),
-                                                refresh_tables: false,
-                                                refresh_columns: false,
-                                            });
-                                        }
-                                        Err(error) => {
-                                            let _ =
-                                                res_tx.send(DbResponse::OperationFailed(error));
-                                        }
-                                    }
-                                    let _ = res_tx.send(DbResponse::Busy(false));
+                            DbRequest::PreflightBackup { db_name, file_path } => {
+                                let _ = res_tx.send(DbResponse::Busy(true));
+                                let result = if let (Some(client), Some(cfg)) =
+                                    (&current_client, &current_cfg)
+                                {
+                                    preflight_backup_database(client, cfg, &db_name, &file_path)
+                                        .await
                                 } else {
-                                    let _ = res_tx.send(DbResponse::OperationFailed(
-                                        "Connect to a PostgreSQL server before backing up a database"
-                                            .to_string(),
-                                    ));
-                                }
+                                    Err("Connect to a PostgreSQL server before backing up a database".to_string())
+                                };
+                                let _ = res_tx.send(DbResponse::BackupRestorePreflight(result));
+                                let _ = res_tx.send(DbResponse::Busy(false));
                             }
-                            DbRequest::RestoreDatabase { db_name, file_path } => {
-                                if let Some(cfg) = &current_cfg {
-                                    let _ = res_tx.send(DbResponse::Busy(true));
-                                    match restore_database(cfg, &db_name, &file_path) {
-                                        Ok(()) => {
-                                            let _ = res_tx.send(DbResponse::OperationSuccess {
-                                                message: format!(
-                                                    "Database '{}' restored from {}",
-                                                    db_name,
-                                                    file_path.display()
-                                                ),
-                                                refresh_tables: cfg.database == db_name,
-                                                refresh_columns: false,
-                                            });
-                                        }
-                                        Err(error) => {
-                                            let _ =
-                                                res_tx.send(DbResponse::OperationFailed(error));
-                                        }
-                                    }
-                                    let _ = res_tx.send(DbResponse::Busy(false));
+                            DbRequest::PreflightRestore { db_name, file_path } => {
+                                let _ = res_tx.send(DbResponse::Busy(true));
+                                let result = if let (Some(client), Some(cfg)) =
+                                    (&current_client, &current_cfg)
+                                {
+                                    preflight_restore_database(client, cfg, &db_name, &file_path)
+                                        .await
                                 } else {
-                                    let _ = res_tx.send(DbResponse::OperationFailed(
-                                        "Connect to a PostgreSQL server before restoring a database"
-                                            .to_string(),
-                                    ));
-                                }
+                                    Err("Connect to a PostgreSQL server before restoring a database".to_string())
+                                };
+                                let _ = res_tx.send(DbResponse::BackupRestorePreflight(result));
+                                let _ = res_tx.send(DbResponse::Busy(false));
+                            }
+                            DbRequest::RunBackup { db_name, file_path } => {
+                                let _ = res_tx.send(DbResponse::Busy(true));
+                                let result = if let Some(cfg) = &current_cfg {
+                                    let progress_tx = res_tx.clone();
+                                    backup_database(cfg, &db_name, &file_path, |line| {
+                                        let _ = progress_tx.send(
+                                            DbResponse::BackupRestoreProgress(line.to_string()),
+                                        );
+                                    })
+                                } else {
+                                    Err("Connection was closed before the backup started".to_string())
+                                };
+                                let _ = res_tx.send(DbResponse::BackupRestoreFinished {
+                                    database: db_name,
+                                    is_restore: false,
+                                    result,
+                                });
+                                let _ = res_tx.send(DbResponse::Busy(false));
+                            }
+                            DbRequest::RunRestore {
+                                db_name,
+                                file_path,
+                                clean_before_restore,
+                                selected_entries,
+                            } => {
+                                let _ = res_tx.send(DbResponse::Busy(true));
+                                let result = if let Some(cfg) = &current_cfg {
+                                    let progress_tx = res_tx.clone();
+                                    restore_database(
+                                        cfg,
+                                        &db_name,
+                                        &file_path,
+                                        clean_before_restore,
+                                        &selected_entries,
+                                        |line| {
+                                            let _ = progress_tx.send(
+                                                DbResponse::BackupRestoreProgress(line.to_string()),
+                                            );
+                                        },
+                                    )
+                                } else {
+                                    Err("Connection was closed before the restore started".to_string())
+                                };
+                                let _ = res_tx.send(DbResponse::BackupRestoreFinished {
+                                    database: db_name,
+                                    is_restore: true,
+                                    result,
+                                });
+                                let _ = res_tx.send(DbResponse::Busy(false));
                             }
                             DbRequest::DropObject(object) => {
                                 if let Some(client) = &current_client {
@@ -1666,10 +1705,256 @@ where
     Ok((client, version))
 }
 
-fn backup_database(cfg: &ConnectionConfig, database: &str, file_path: &Path) -> Result<(), String> {
+async fn preflight_backup_database(
+    client: &Client,
+    cfg: &ConnectionConfig,
+    database: &str,
+    file_path: &Path,
+) -> Result<BackupRestorePreflight, String> {
+    check_backup_destination(file_path)?;
+    let (server_version, server_major, database_size_bytes) =
+        backup_server_info(client, database).await?;
+    let tool_version = postgres_tool_version("pg_dump")?;
+    let tool_major = parse_version_major(&tool_version)
+        .ok_or_else(|| format!("Could not parse pg_dump version: {tool_version}"))?;
+    if tool_major < server_major {
+        return Err(format!(
+            "pg_dump {tool_version} is older than PostgreSQL server {server_version}. Install a pg_dump client of major version {server_major} or newer."
+        ));
+    }
+
+    let available_space_bytes = available_disk_space(
+        file_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    );
+    let mut warnings = Vec::new();
+    if let (Some(database_size), Some(free_space)) = (database_size_bytes, available_space_bytes)
+        && database_size > free_space
+    {
+        warnings.push(
+            "The database is larger than the available destination space. Custom-format compression may reduce the backup size, but this estimate is not a guarantee."
+                .to_string(),
+        );
+    }
+    if cfg.tls_mode == TlsMode::Prefer {
+        warnings.push(
+            "PostgreSQL client tools use verified TLS for Prefer profiles; they will not fall back to plaintext. Use Disable explicitly for a plaintext-only server."
+                .to_string(),
+        );
+    }
+
+    Ok(BackupRestorePreflight {
+        tool: "pg_dump".to_string(),
+        tool_version,
+        server_version,
+        target_database: database.to_string(),
+        format: "Custom archive".to_string(),
+        command_preview: format!(
+            "{}pg_dump --format=custom --verbose --no-password --host {} --port {} --username {} --dbname {} > {}",
+            postgres_tool_environment_preview(cfg),
+            shell_quote(&cfg.host),
+            cfg.port,
+            shell_quote(&cfg.username),
+            shell_quote(database),
+            shell_quote(&file_path.display().to_string())
+        ),
+        database_size_bytes,
+        available_space_bytes,
+        restore_entries: std::sync::Arc::new(Vec::new()),
+        warnings,
+    })
+}
+
+async fn preflight_restore_database(
+    client: &Client,
+    cfg: &ConnectionConfig,
+    database: &str,
+    file_path: &Path,
+) -> Result<BackupRestorePreflight, String> {
+    if !file_path.is_file() {
+        return Err(format!(
+            "Backup file does not exist or is not a regular file: {}",
+            file_path.display()
+        ));
+    }
+    let (server_version, server_major, database_size_bytes) =
+        backup_server_info(client, database).await?;
+    let is_sql_file = is_plain_sql_backup(file_path);
+    let tool = if is_sql_file { "psql" } else { "pg_restore" };
+    let tool_version = postgres_tool_version(tool)?;
+    let mut warnings = Vec::new();
+    let mut restore_entries = Vec::new();
+
+    if is_sql_file {
+        if let Some(dump_major) = plain_sql_dump_major(file_path) {
+            if dump_major > server_major {
+                warnings.push(format!(
+                    "This script was produced by PostgreSQL major version {dump_major}, newer than the target server ({server_version}); restore may fail on incompatible SQL."
+                ));
+            }
+        } else {
+            warnings.push(
+                "The script's source PostgreSQL version could not be determined.".to_string(),
+            );
+        }
+    } else {
+        let listing = list_restore_archive(file_path)?;
+        if let Some(dump_major) = parse_dumped_from_major(&listing) {
+            if dump_major > server_major {
+                warnings.push(format!(
+                    "This archive was created from PostgreSQL major version {dump_major}, newer than the target server ({server_version}); restore may fail on incompatible objects."
+                ));
+            }
+        } else {
+            warnings.push(
+                "The archive's source PostgreSQL version could not be determined.".to_string(),
+            );
+        }
+        if let Some(dump_tool_major) = parse_dumped_by_major(&listing)
+            && let Some(restore_tool_major) = parse_version_major(&tool_version)
+            && restore_tool_major < dump_tool_major
+        {
+            warnings.push(format!(
+                "This archive was created by pg_dump major version {dump_tool_major}, newer than the installed pg_restore ({tool_version}); install a matching or newer pg_restore if restore fails."
+            ));
+        }
+        restore_entries = parse_restore_entries(&listing);
+        if restore_entries.is_empty() {
+            return Err(
+                "The archive contains no selectable restore entries. Verify that it is a valid pg_dump archive."
+                    .to_string(),
+            );
+        }
+    }
+    if cfg.tls_mode == TlsMode::Prefer {
+        warnings.push(
+            "PostgreSQL client tools use verified TLS for Prefer profiles; they will not fall back to plaintext. Use Disable explicitly for a plaintext-only server."
+                .to_string(),
+        );
+    }
+
+    Ok(BackupRestorePreflight {
+        tool: tool.to_string(),
+        tool_version,
+        server_version,
+        target_database: database.to_string(),
+        format: if is_sql_file {
+            "Plain SQL script".to_string()
+        } else {
+            "PostgreSQL archive".to_string()
+        },
+        command_preview: if is_sql_file {
+            format!(
+                "{}psql --no-password --set=ON_ERROR_STOP=on --echo-errors --host {} --port {} --username {} --dbname {} --file {}",
+                postgres_tool_environment_preview(cfg),
+                shell_quote(&cfg.host),
+                cfg.port,
+                shell_quote(&cfg.username),
+                shell_quote(database),
+                shell_quote(&file_path.display().to_string())
+            )
+        } else {
+            format!(
+                "{}pg_restore --verbose --exit-on-error --no-password --host {} --port {} --username {} --dbname {} {}",
+                postgres_tool_environment_preview(cfg),
+                shell_quote(&cfg.host),
+                cfg.port,
+                shell_quote(&cfg.username),
+                shell_quote(database),
+                shell_quote(&file_path.display().to_string())
+            )
+        },
+        database_size_bytes,
+        available_space_bytes: None,
+        restore_entries: std::sync::Arc::new(restore_entries),
+        warnings,
+    })
+}
+
+async fn backup_server_info(
+    client: &Client,
+    database: &str,
+) -> Result<(String, u32, Option<u64>), String> {
+    let (server_version, server_version_num): (String, i32) = client
+        .query_one(
+            "SELECT current_setting('server_version'), current_setting('server_version_num')::int",
+            &[],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1)))
+        .map_err(|error| format!("Could not determine PostgreSQL server version: {error}"))?;
+
+    let database_exists: bool = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_database WHERE datname = $1)",
+            &[&database],
+        )
+        .await
+        .map(|row| row.get(0))
+        .map_err(|error| format!("Could not check target database: {error}"))?;
+    if !database_exists {
+        return Err(format!(
+            "Target database '{database}' does not exist on this server."
+        ));
+    }
+
+    let can_connect: bool = client
+        .query_one(
+            "SELECT has_database_privilege(current_user, $1, 'CONNECT')",
+            &[&database],
+        )
+        .await
+        .map(|row| row.get(0))
+        .map_err(|error| format!("Could not check target database access: {error}"))?;
+    if !can_connect {
+        return Err(format!(
+            "The current PostgreSQL role does not have CONNECT permission on '{database}'."
+        ));
+    }
+
+    let database_size_bytes = client
+        .query_one("SELECT pg_database_size($1)::bigint", &[&database])
+        .await
+        .ok()
+        .map(|row| row.get::<_, i64>(0).max(0) as u64);
+
+    let server_major = u32::try_from(server_version_num / 10_000)
+        .map_err(|_| "PostgreSQL returned an invalid server_version_num".to_string())?;
+    Ok((server_version, server_major, database_size_bytes))
+}
+
+fn backup_database(
+    cfg: &ConnectionConfig,
+    database: &str,
+    file_path: &Path,
+    mut on_progress: impl FnMut(&str),
+) -> Result<String, String> {
+    let mut output_options = OpenOptions::new();
+    output_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        output_options.mode(0o600);
+    }
+    let output_file = output_options.open(file_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "Backup destination already exists; pg-mini will not overwrite it: {}",
+                file_path.display()
+            )
+        } else {
+            format!(
+                "Cannot create backup destination {}: {error}",
+                file_path.display()
+            )
+        }
+    })?;
     let mut command = postgres_tool("pg_dump");
     command
         .arg("--format=custom")
+        .arg("--verbose")
         .arg("--no-password")
         .arg("--host")
         .arg(&cfg.host)
@@ -1679,17 +1964,55 @@ fn backup_database(cfg: &ConnectionConfig, database: &str, file_path: &Path) -> 
         .arg(&cfg.username)
         .arg("--dbname")
         .arg(database)
-        .arg("--file")
-        .arg(file_path);
-    set_tool_password(&mut command, &cfg.password);
-    run_postgres_tool(command, "pg_dump")
+        .stdout(Stdio::from(output_file));
+    apply_postgres_tool_environment(&mut command, cfg);
+    match run_postgres_tool(command, "pg_dump", &mut on_progress) {
+        Ok(elapsed) => {
+            let size = fs::metadata(file_path)
+                .map_err(|error| {
+                    format!(
+                        "pg_dump finished, but the backup file size could not be checked ({}): {error}",
+                        file_path.display()
+                    )
+                })?
+                .len();
+            if size == 0 {
+                return match fs::remove_file(file_path) {
+                    Ok(()) => {
+                        Err("pg_dump reported success but produced an empty file.".to_string())
+                    }
+                    Err(error) => Err(format!(
+                        "pg_dump reported success but produced an empty file that could not be removed: {error}"
+                    )),
+                };
+            }
+            Ok(format!(
+                "Backup completed with pg_dump in {} ({})",
+                format_elapsed(elapsed),
+                format_bytes(size)
+            ))
+        }
+        Err(error) => {
+            let cleanup = fs::remove_file(file_path);
+            if let Err(cleanup_error) = cleanup {
+                Err(format!(
+                    "{error}. The incomplete backup file could not be removed: {cleanup_error}"
+                ))
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 fn restore_database(
     cfg: &ConnectionConfig,
     database: &str,
     file_path: &Path,
-) -> Result<(), String> {
+    clean_before_restore: bool,
+    selected_entries: &[String],
+    mut on_progress: impl FnMut(&str),
+) -> Result<String, String> {
     if !file_path.is_file() {
         return Err(format!(
             "Backup file does not exist or is not a regular file: {}",
@@ -1709,24 +2032,335 @@ fn restore_database(
         .arg("--username")
         .arg(&cfg.username)
         .arg("--dbname")
-        .arg(database);
+        .arg(database)
+        .stdout(Stdio::null());
 
-    if is_sql_file {
+    let selection_file = if is_sql_file {
+        if clean_before_restore {
+            return Err(
+                "Clean-before-restore is not supported for plain SQL scripts. Use a PostgreSQL archive or restore into an empty database."
+                    .to_string(),
+            );
+        }
+        if !selected_entries.is_empty() {
+            return Err("Object selection is only supported for PostgreSQL archives.".to_string());
+        }
         command
             .arg("--set=ON_ERROR_STOP=on")
+            .arg("--echo-errors")
             .arg("--file")
             .arg(file_path);
+        None
     } else {
-        command.arg("--exit-on-error").arg(file_path);
+        let list = list_restore_archive(file_path)?;
+        let entries = parse_restore_entries(&list);
+        if selected_entries.is_empty() {
+            return Err("Select at least one archive entry to restore.".to_string());
+        }
+        let contents = build_restore_list(&entries, selected_entries)?;
+        let selection_file = create_restore_selection_file(&contents)?;
+        command.arg("--verbose").arg("--exit-on-error");
+        if clean_before_restore {
+            command.arg("--clean").arg("--if-exists");
+        }
+        command
+            .arg("--use-list")
+            .arg(&selection_file)
+            .arg(file_path);
+        Some(selection_file)
+    };
+    apply_postgres_tool_environment(&mut command, cfg);
+    let result = run_postgres_tool(command, tool, &mut on_progress).map(|elapsed| {
+        format!(
+            "Restore completed with {tool} in {}",
+            format_elapsed(elapsed)
+        )
+    });
+    if let Some(path) = selection_file {
+        if let Err(error) = fs::remove_file(&path) {
+            return match result {
+                Ok(message) => Err(format!(
+                    "{message}, but the temporary selection list could not be removed: {error}"
+                )),
+                Err(message) => Err(format!(
+                    "{message}. The temporary selection list could not be removed: {error}"
+                )),
+            };
+        }
     }
-    set_tool_password(&mut command, &cfg.password);
-    run_postgres_tool(command, tool)
+    result
 }
 
 fn is_plain_sql_backup(file_path: &Path) -> bool {
     file_path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("sql"))
+}
+
+fn check_backup_destination(file_path: &Path) -> Result<(), String> {
+    if file_path.exists() {
+        return Err(format!(
+            "Backup destination already exists; pg-mini will not overwrite it: {}",
+            file_path.display()
+        ));
+    }
+    let parent = file_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Err(format!(
+            "Backup destination directory does not exist: {}",
+            parent.display()
+        ));
+    }
+    let probe_path = parent.join(format!(".pg-mini-write-test-{}", uuid::Uuid::new_v4()));
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe_path)
+        .map_err(|error| {
+            format!(
+                "Backup destination directory is not writable ({}): {error}",
+                parent.display()
+            )
+        })?;
+    fs::remove_file(&probe_path).map_err(|error| {
+        format!(
+            "Could not remove backup destination access-check file {}: {error}",
+            probe_path.display()
+        )
+    })
+}
+
+fn available_disk_space(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let output = Command::new("df").arg("-Pk").arg(path).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .last()?
+            .to_string();
+        let available_kib = line.split_whitespace().nth(3)?.parse::<u64>().ok()?;
+        Some(available_kib.saturating_mul(1024))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut available = 0_u64;
+        let result = unsafe {
+            GetDiskFreeSpaceExW(
+                path.as_ptr(),
+                &mut available,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        (result != 0).then_some(available)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn postgres_tool_version(tool: &str) -> Result<String, String> {
+    let output = postgres_tool(tool)
+        .arg("--version")
+        .output()
+        .map_err(|error| {
+            format!(
+                "Required client tool '{tool}' is unavailable: {error}. Install the PostgreSQL client utilities and make sure {tool} is on PATH."
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "Could not determine {tool} version ({}). Install or repair the PostgreSQL client utilities.",
+            output.status
+        ));
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        return Err(format!(
+            "{tool} returned no version information. Verify the PostgreSQL client installation."
+        ));
+    }
+    Ok(version)
+}
+
+fn parse_version_major(version: &str) -> Option<u32> {
+    version
+        .split_whitespace()
+        .rev()
+        .find_map(|part| part.split('.').next()?.parse().ok())
+}
+
+fn plain_sql_dump_major(file_path: &Path) -> Option<u32> {
+    let file = File::open(file_path).ok()?;
+    for line in BufReader::new(file).lines().take(100).flatten() {
+        if let Some(version) = line.split_once("Dumped from database version:") {
+            return parse_version_major(version.1.trim());
+        }
+    }
+    None
+}
+
+fn parse_dumped_from_major(archive_listing: &str) -> Option<u32> {
+    archive_listing.lines().find_map(|line| {
+        line.split_once("Dumped from database version:")
+            .and_then(|(_, version)| parse_version_major(version.trim()))
+    })
+}
+
+fn parse_dumped_by_major(archive_listing: &str) -> Option<u32> {
+    archive_listing.lines().find_map(|line| {
+        line.split_once("Dumped by pg_dump version:")
+            .and_then(|(_, version)| parse_version_major(version.trim()))
+    })
+}
+
+fn list_restore_archive(file_path: &Path) -> Result<String, String> {
+    let output = postgres_tool("pg_restore")
+        .arg("--list")
+        .arg(file_path)
+        .output()
+        .map_err(|error| {
+            format!(
+                "Could not start pg_restore to inspect the archive: {error}. Install the PostgreSQL client utilities and make sure pg_restore is on PATH."
+            )
+        })?;
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "pg_restore could not read this archive ({}): {}. Check the file format and that it is not truncated.",
+            output.status,
+            details.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn parse_restore_entries(listing: &str) -> Vec<RestoreArchiveEntry> {
+    listing
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with(';')
+        })
+        .map(|line| RestoreArchiveEntry {
+            line: line.to_string(),
+        })
+        .collect()
+}
+
+fn build_restore_list(
+    entries: &[RestoreArchiveEntry],
+    selected_entries: &[String],
+) -> Result<String, String> {
+    let selected: std::collections::BTreeSet<&str> =
+        selected_entries.iter().map(String::as_str).collect();
+    if selected.is_empty() {
+        return Err("Select at least one archive entry to restore.".to_string());
+    }
+    if let Some(entry) = selected
+        .iter()
+        .find(|selected_line| !entries.iter().any(|entry| entry.line == **selected_line))
+    {
+        return Err(format!(
+            "Selected archive entry is no longer available ({entry}); inspect the backup again."
+        ));
+    }
+    Ok(entries
+        .iter()
+        .filter(|entry| selected.contains(entry.line.as_str()))
+        .map(|entry| entry.line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n")
+}
+
+fn create_restore_selection_file(contents: &str) -> Result<PathBuf, String> {
+    let path =
+        std::env::temp_dir().join(format!("pg-mini-restore-list-{}.txt", uuid::Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("Could not create temporary restore selection list: {error}"))?;
+    let write_result = file.write_all(contents.as_bytes());
+    drop(file);
+    if let Err(error) = write_result {
+        return match fs::remove_file(&path) {
+            Ok(()) => Err(format!(
+                "Could not write temporary restore selection list: {error}"
+            )),
+            Err(cleanup_error) => Err(format!(
+                "Could not write temporary restore selection list: {error}. The incomplete file {} could not be removed: {cleanup_error}",
+                path.display()
+            )),
+        };
+    }
+    Ok(path)
+}
+
+fn shell_quote(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\\''"))
+}
+
+fn postgres_tool_environment_preview(cfg: &ConnectionConfig) -> String {
+    let sslmode = match cfg.tls_mode {
+        TlsMode::Disable => "disable",
+        TlsMode::Prefer => "verify-full",
+        TlsMode::Require => "verify-full",
+    };
+    let cert = if cfg.tls_root_cert.is_empty() {
+        String::new()
+    } else {
+        format!(" PGSSLROOTCERT={}", shell_quote(&cfg.tls_root_cert))
+    };
+    format!("PGSSLMODE={sslmode}{cert} ")
+}
+
+fn apply_postgres_tool_environment(command: &mut Command, cfg: &ConnectionConfig) {
+    let sslmode = match cfg.tls_mode {
+        TlsMode::Disable => "disable",
+        TlsMode::Prefer => "verify-full",
+        TlsMode::Require => "verify-full",
+    };
+    command.env("PGSSLMODE", sslmode);
+    if cfg.tls_root_cert.is_empty() {
+        command.env_remove("PGSSLROOTCERT");
+    } else {
+        command.env("PGSSLROOTCERT", &cfg.tls_root_cert);
+    }
+    set_tool_password(command, &cfg.password);
+}
+
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    format!("{:.1}s", elapsed.as_secs_f64())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 fn postgres_tool(name: &str) -> Command {
@@ -1745,27 +2379,61 @@ fn set_tool_password(command: &mut Command, password: &str) {
     }
 }
 
-fn run_postgres_tool(mut command: Command, tool: &str) -> Result<(), String> {
-    command.stdout(Stdio::null());
-    let output = command.output().map_err(|error| {
-        format!(
-            "Could not start {}: {}. Install the PostgreSQL client utilities and make sure {} is available on PATH.",
-            tool, error, tool
-        )
+fn run_postgres_tool(
+    mut command: Command,
+    tool: &str,
+    on_progress: &mut impl FnMut(&str),
+) -> Result<std::time::Duration, String> {
+    let started_at = Instant::now();
+    let mut child = command
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "Could not start {tool}: {error}. Install the PostgreSQL client utilities and make sure {tool} is available on PATH."
+            )
+        })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        format!("{tool} stderr was unavailable; check that the client tool can be started.")
     })?;
-    if output.status.success() {
-        return Ok(());
+    let mut error_lines = VecDeque::new();
+    let mut read_error = None;
+    for line in BufReader::new(stderr).lines() {
+        match line {
+            Ok(line) => {
+                on_progress(&line);
+                if !line.trim().is_empty() {
+                    error_lines.push_back(line);
+                    while error_lines.len() > 40 {
+                        error_lines.pop_front();
+                    }
+                }
+            }
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
+        }
     }
-
-    let details = String::from_utf8_lossy(&output.stderr);
+    let status = child
+        .wait()
+        .map_err(|error| format!("Could not wait for {tool} to finish: {error}"))?;
+    let elapsed = started_at.elapsed();
+    if let Some(error) = read_error {
+        return Err(format!("Could not read {tool} progress output: {error}"));
+    }
+    if status.success() {
+        return Ok(elapsed);
+    }
+    let details = error_lines.into_iter().collect::<Vec<_>>().join("\n");
     Err(format!(
-        "{} failed with status {}{}",
-        tool,
-        output.status,
-        if details.trim().is_empty() {
+        "{tool} failed with status {} after {}{}",
+        status,
+        format_elapsed(elapsed),
+        if details.is_empty() {
             String::new()
         } else {
-            format!(": {}", details.trim())
+            format!(":\n{details}")
         }
     ))
 }
@@ -2200,8 +2868,13 @@ async fn save_role_impl(client: &Client, form: &RoleForm) -> Result<(), String> 
 
 #[cfg(test)]
 mod db_tests {
-    use super::{is_plain_sql_backup, parse_ha_f64, role_sql_preview};
-    use crate::models::RoleForm;
+    use super::{
+        build_restore_list, check_backup_destination, is_plain_sql_backup, parse_dumped_by_major,
+        parse_dumped_from_major, parse_ha_f64, parse_restore_entries, parse_version_major,
+        restore_database, role_sql_preview,
+    };
+    use crate::models::{ConnectionConfig, RoleForm};
+    use std::fs;
     use std::path::Path;
 
     #[test]
@@ -2210,6 +2883,82 @@ mod db_tests {
         assert!(is_plain_sql_backup(Path::new("backup.SQL")));
         assert!(!is_plain_sql_backup(Path::new("backup.dump")));
         assert!(!is_plain_sql_backup(Path::new("backup.tar")));
+    }
+
+    #[test]
+    fn backup_destination_is_writable_and_existing_files_are_never_overwritten() {
+        let directory =
+            std::env::temp_dir().join(format!("pg-mini-backup-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("backup.dump");
+
+        assert!(check_backup_destination(&path).is_ok());
+        assert!(!path.exists());
+        fs::write(&path, b"existing backup").unwrap();
+        assert!(
+            check_backup_destination(&path)
+                .unwrap_err()
+                .contains("will not overwrite")
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn parses_postgres_client_and_archive_versions() {
+        assert_eq!(parse_version_major("pg_dump (PostgreSQL) 17.4"), Some(17));
+        assert_eq!(parse_version_major("psql (PostgreSQL) 9.6.24"), Some(9));
+        assert_eq!(
+            parse_dumped_from_major(
+                "; Dumped from database version: 16.3\n; Dumped by pg_dump version: 17.0"
+            ),
+            Some(16)
+        );
+        assert_eq!(
+            parse_dumped_by_major(
+                "; Dumped from database version: 16.3\n; Dumped by pg_dump version: 17.0"
+            ),
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn restore_selection_contains_only_checked_archive_entries() {
+        let entries = parse_restore_entries(
+            "; Archive created at 2025-01-01\n1; 0 123 TABLE public first owner\n2; 0 124 TABLE public second owner\n",
+        );
+        let selected = vec![entries[1].line.clone()];
+        assert_eq!(
+            build_restore_list(&entries, &selected).unwrap(),
+            "2; 0 124 TABLE public second owner\n"
+        );
+        assert!(build_restore_list(&entries, &[]).is_err());
+        assert!(
+            build_restore_list(&entries, &["stale entry".to_string()])
+                .unwrap_err()
+                .contains("no longer available")
+        );
+    }
+
+    #[test]
+    fn clean_restore_is_rejected_for_plain_sql_scripts() {
+        let path =
+            std::env::temp_dir().join(format!("pg-mini-restore-test-{}.sql", uuid::Uuid::new_v4()));
+        fs::write(&path, "-- PostgreSQL database dump\n").unwrap();
+        let result = restore_database(
+            &ConnectionConfig::default(),
+            "test",
+            &path,
+            true,
+            &[],
+            |_| {},
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("not supported for plain SQL scripts")
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

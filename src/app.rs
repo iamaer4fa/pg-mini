@@ -14,6 +14,7 @@ use crate::models::{
 use crate::sql_safety::{is_explain_analyze, sql_requires_review};
 use crate::system_stats::SystemStatsSnapshot;
 use crate::ui::activity_view::render_activity_view;
+use crate::ui::backup_restore::{BackupRestoreAction, BackupRestoreDialog};
 use crate::ui::columns_view::{ColumnsViewAction, render_columns_view};
 use crate::ui::connection_modal::{ConnectionModal, ConnectionModalAction};
 use crate::ui::data_table::{DataTableAction, DataTableState, export_to_csv, render_data_table};
@@ -80,6 +81,7 @@ pub struct PgMiniApp {
     transaction_open: bool,
     close_transaction_warning: bool,
     allow_close_after_transaction_warning: bool,
+    close_backup_restore_warning: bool,
     current_db: String,
     host_port: String,
     connection_modal: ConnectionModal,
@@ -115,6 +117,7 @@ pub struct PgMiniApp {
     add_column_modal: AddColumnModal,
     create_table_modal: CreateTableModal,
     object_ddl_modal: ObjectDdlModal,
+    backup_restore_dialog: BackupRestoreDialog,
     confirm_dialog: ConfirmDialogState,
     rename_object: Option<DbObjectRef>,
     rename_object_name: String,
@@ -163,6 +166,7 @@ impl PgMiniApp {
             transaction_open: false,
             close_transaction_warning: false,
             allow_close_after_transaction_warning: false,
+            close_backup_restore_warning: false,
             current_db: String::new(),
             host_port: String::new(),
             connection_modal,
@@ -194,6 +198,7 @@ impl PgMiniApp {
             add_column_modal: AddColumnModal::default(),
             create_table_modal: CreateTableModal::default(),
             object_ddl_modal: ObjectDdlModal::default(),
+            backup_restore_dialog: BackupRestoreDialog::default(),
             confirm_dialog: ConfirmDialogState::default(),
             rename_object: None,
             rename_object_name: String::new(),
@@ -1068,6 +1073,28 @@ impl PgMiniApp {
                 DbResponse::TransactionState(is_open) => {
                     self.transaction_open = is_open;
                 }
+                DbResponse::BackupRestorePreflight(result) => {
+                    self.backup_restore_dialog.set_preflight(result);
+                }
+                DbResponse::BackupRestoreProgress(line) => {
+                    self.backup_restore_dialog.add_progress(line);
+                }
+                DbResponse::BackupRestoreFinished {
+                    database,
+                    is_restore,
+                    result,
+                } => {
+                    match &result {
+                        Ok(message) => self.show_toast(message.clone(), false),
+                        Err(error) => self.show_toast(error.clone(), true),
+                    }
+                    self.backup_restore_dialog.finish(result);
+                    if is_restore && self.current_db == database {
+                        self.tables.clear();
+                        self.sidebar.reset_object_tree();
+                        self.db_worker.send(DbRequest::FetchDatabases);
+                    }
+                }
                 DbResponse::OperationSuccess {
                     message,
                     refresh_tables,
@@ -1164,10 +1191,14 @@ impl eframe::App for PgMiniApp {
         self.poll_db_responses(ctx);
         if !self.allow_close_after_transaction_warning
             && ctx.input(|input| input.viewport().close_requested())
-            && self.has_open_transaction()
         {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.close_transaction_warning = true;
+            if self.backup_restore_dialog.is_running() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_backup_restore_warning = true;
+            } else if self.has_open_transaction() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_transaction_warning = true;
+            }
         }
         if self.active_tab == ActiveTab::Activity {
             ctx.request_repaint_after(Duration::from_secs(1));
@@ -1253,7 +1284,7 @@ impl eframe::App for PgMiniApp {
                             for (server_id, label) in &server_options {
                                 if ui
                                     .add_enabled(
-                                        !self.is_busy,
+                                        !self.is_busy && !self.backup_restore_dialog.is_open(),
                                         egui::SelectableLabel::new(
                                             active_server_id.as_ref() == Some(server_id),
                                             label,
@@ -1275,7 +1306,10 @@ impl eframe::App for PgMiniApp {
                         RichText::new(format!("{}/{}", self.host_port, self.current_db)).strong(),
                     );
                     if ui
-                        .add_enabled(!self.is_busy, egui::Button::new("🔌 Disconnect"))
+                        .add_enabled(
+                            !self.is_busy && !self.backup_restore_dialog.is_open(),
+                            egui::Button::new("🔌 Disconnect"),
+                        )
                         .clicked()
                     {
                         if self.transaction_open {
@@ -1303,7 +1337,7 @@ impl eframe::App for PgMiniApp {
 
                 if ui
                     .add_enabled(
-                        !self.is_busy,
+                        !self.is_busy && !self.backup_restore_dialog.is_open(),
                         egui::Button::new(
                             RichText::new("➕ Connect Server")
                                 .strong()
@@ -1508,7 +1542,19 @@ impl eframe::App for PgMiniApp {
                                 .set_file_name(format!("{db_name}.dump"))
                                 .save_file()
                             {
-                                self.db_worker.send(DbRequest::BackupDatabase {
+                                let server = self
+                                    .active_connection
+                                    .as_ref()
+                                    .map(|connection| {
+                                        format!(
+                                            "{} ({}:{})",
+                                            connection.name, connection.host, connection.port
+                                        )
+                                    })
+                                    .unwrap_or_else(|| self.host_port.clone());
+                                self.backup_restore_dialog
+                                    .begin_backup(db_name.clone(), server, file_path.clone());
+                                self.db_worker.send(DbRequest::PreflightBackup {
                                     db_name,
                                     file_path,
                                 });
@@ -1520,19 +1566,22 @@ impl eframe::App for PgMiniApp {
                                 .add_filter("SQL scripts", &["sql"])
                                 .pick_file()
                             {
-                                self.confirm_dialog = ConfirmDialogState {
-                                    is_open: true,
-                                    title: "Restore Database".to_string(),
-                                    message: format!(
-                                        "Restore '{}' from '{}'? This executes the backup against the selected database and may modify or replace its objects and data.",
-                                        db_name,
-                                        file_path.display()
-                                    ),
-                                    action: Some(ConfirmAction::RestoreDatabase {
-                                        db_name,
-                                        file_path,
-                                    }),
-                                };
+                                let server = self
+                                    .active_connection
+                                    .as_ref()
+                                    .map(|connection| {
+                                        format!(
+                                            "{} ({}:{})",
+                                            connection.name, connection.host, connection.port
+                                        )
+                                    })
+                                    .unwrap_or_else(|| self.host_port.clone());
+                                self.backup_restore_dialog
+                                    .begin_restore(db_name.clone(), server, file_path.clone());
+                                self.db_worker.send(DbRequest::PreflightRestore {
+                                    db_name,
+                                    file_path,
+                                });
                             }
                         }
                         SidebarAction::RefreshTables => {
@@ -2094,10 +2143,6 @@ impl eframe::App for PgMiniApp {
                 ConfirmAction::DropRole { role_name } => {
                     self.db_worker.send(DbRequest::DropRole(role_name));
                 }
-                ConfirmAction::RestoreDatabase { db_name, file_path } => {
-                    self.db_worker
-                        .send(DbRequest::RestoreDatabase { db_name, file_path });
-                }
                 ConfirmAction::ExecuteSql { sql, read_only } => {
                     self.submit_sql_execution(sql, read_only);
                 }
@@ -2128,6 +2173,33 @@ impl eframe::App for PgMiniApp {
             }
         }
 
+        if let Some(action) = self.backup_restore_dialog.show(ctx, self.is_busy) {
+            match action {
+                BackupRestoreAction::RunBackup {
+                    database,
+                    file_path,
+                } => {
+                    self.db_worker.send(DbRequest::RunBackup {
+                        db_name: database,
+                        file_path,
+                    });
+                }
+                BackupRestoreAction::RunRestore {
+                    database,
+                    file_path,
+                    clean_before_restore,
+                    selected_entries,
+                } => {
+                    self.db_worker.send(DbRequest::RunRestore {
+                        db_name: database,
+                        file_path,
+                        clean_before_restore,
+                        selected_entries,
+                    });
+                }
+            }
+        }
+
         if self.close_transaction_warning {
             let mut keep_open = true;
             egui::Window::new("Open transaction")
@@ -2145,13 +2217,37 @@ impl eframe::App for PgMiniApp {
                             self.close_transaction_warning = false;
                         }
                         if ui.button("Close anyway").clicked() {
-                            self.allow_close_after_transaction_warning = true;
                             self.close_transaction_warning = false;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            if self.backup_restore_dialog.is_running() {
+                                self.close_backup_restore_warning = true;
+                            } else {
+                                self.allow_close_after_transaction_warning = true;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
                         }
                     });
                 });
             self.close_transaction_warning &= keep_open;
+        }
+
+        if self.close_backup_restore_warning {
+            let mut keep_open = true;
+            egui::Window::new("Backup or restore in progress")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut keep_open)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(
+                        "Wait for the backup or restore to finish before closing pg-mini. Closing now could interrupt the operation and leave a partial backup or restore.",
+                    );
+                    ui.add_space(10.0);
+                    if ui.button("Return to operation").clicked() {
+                        self.close_backup_restore_warning = false;
+                    }
+                });
+            self.close_backup_restore_warning &=
+                keep_open && self.backup_restore_dialog.is_running();
         }
 
         if let Some(object) = self.rename_object.clone() {
