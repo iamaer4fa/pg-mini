@@ -1,6 +1,6 @@
+use crate::models::AppConfig;
 use std::fs;
 use std::path::PathBuf;
-use crate::models::AppConfig;
 
 pub struct ConfigManager;
 

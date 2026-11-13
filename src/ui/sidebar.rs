@@ -1160,13 +1160,12 @@ impl Sidebar {
                                                 }
                                             });
                                             if ui.button("Manage Grants...").clicked() {
-                                                action = Some(SidebarAction::OpenDdlForm(
-                                                    DdlForm::new(
+                                                action =
+                                                    Some(SidebarAction::OpenDdlForm(DdlForm::new(
                                                         DdlFormKind::Grant,
                                                         &item.schema,
                                                         &item.name,
-                                                    ),
-                                                ));
+                                                    )));
                                                 ui.close_menu();
                                             }
                                         }

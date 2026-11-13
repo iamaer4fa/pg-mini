@@ -1,6 +1,6 @@
-use egui::{Color32, RichText, Window};
 use crate::models::{AddColumnForm, ConfirmAction, ConfirmDialogState, CreateTableForm, RoleItem};
 use crate::sql_ddl::{ConstraintKind, DdlForm, DdlFormKind};
+use egui::{Color32, RichText, ScrollArea, Window};
 
 pub struct AddColumnModal {
     pub is_open: bool,
@@ -34,124 +34,155 @@ impl AddColumnModal {
             return None;
         }
 
-        Window::new(format!("➕ Add Column to {}.{}", self.form.schema, self.form.table))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                ui.set_min_width(460.0);
+        Window::new(format!(
+            "➕ Add Column to {}.{}",
+            self.form.schema, self.form.table
+        ))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.set_min_width(460.0);
 
-                ui.heading("Add New Column");
-                ui.separator();
-                ui.add_space(4.0);
+            ui.heading("Add New Column");
+            ui.separator();
+            ui.add_space(4.0);
 
-                egui::Grid::new("add_col_grid")
-                    .num_columns(2)
-                    .spacing([12.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("Column Name:");
-                        ui.text_edit_singleline(&mut self.form.column_name);
-                        ui.end_row();
+            egui::Grid::new("add_col_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Column Name:");
+                    ui.text_edit_singleline(&mut self.form.column_name);
+                    ui.end_row();
 
-                        ui.label("Data Type:");
-                        ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt("data_type_select")
-                                .width(150.0)
-                                .selected_text(&self.custom_type)
-                                .show_ui(ui, |ui| {
-                                    for t in &[
-                                        "VARCHAR(255)",
-                                        "TEXT",
-                                        "INTEGER",
-                                        "BIGINT",
-                                        "BOOLEAN",
-                                        "TIMESTAMP",
-                                        "TIMESTAMPTZ",
-                                        "DATE",
-                                        "TIME",
-                                        "NUMERIC(10,2)",
-                                        "DOUBLE PRECISION",
-                                        "UUID",
-                                        "JSONB",
-                                        "BYTEA",
-                                    ] {
-                                        if ui.selectable_value(&mut self.custom_type, t.to_string(), *t).clicked() {
-                                            self.form.data_type = self.custom_type.clone();
-                                        }
+                    ui.label("Data Type:");
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("data_type_select")
+                            .width(150.0)
+                            .selected_text(&self.custom_type)
+                            .show_ui(ui, |ui| {
+                                for t in &[
+                                    "VARCHAR(255)",
+                                    "TEXT",
+                                    "INTEGER",
+                                    "BIGINT",
+                                    "BOOLEAN",
+                                    "TIMESTAMP",
+                                    "TIMESTAMPTZ",
+                                    "DATE",
+                                    "TIME",
+                                    "NUMERIC(10,2)",
+                                    "DOUBLE PRECISION",
+                                    "UUID",
+                                    "JSONB",
+                                    "BYTEA",
+                                ] {
+                                    if ui
+                                        .selectable_value(&mut self.custom_type, t.to_string(), *t)
+                                        .clicked()
+                                    {
+                                        self.form.data_type = self.custom_type.clone();
                                     }
-                                });
+                                }
+                            });
 
-                            if ui.text_edit_singleline(&mut self.custom_type).changed() {
-                                self.form.data_type = self.custom_type.clone();
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("Nullable:");
-                        ui.checkbox(&mut self.form.is_nullable, "Allow NULL (uncheck for NOT NULL)");
-                        ui.end_row();
-
-                        ui.label("Default Value:");
-                        ui.text_edit_singleline(&mut self.form.default_value);
-                        ui.end_row();
-
-                        ui.label("Primary Key:");
-                        ui.checkbox(&mut self.form.is_primary_key, "Set as Primary Key");
-                        ui.end_row();
-                    });
-
-                ui.add_space(8.0);
-
-                // SQL Preview
-                let sql_preview = generate_sql_preview(&self.form);
-                ui.label(RichText::new("Generated SQL:").size(11.0).color(Color32::GRAY));
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(25, 28, 35))
-                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(50, 55, 65)))
-                    .rounding(4.0)
-                    .inner_margin(6.0)
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(&sql_preview).monospace().color(Color32::from_rgb(100, 200, 255)));
-                    });
-
-                if let Some(err) = &self.error_message {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(err).color(Color32::LIGHT_RED).strong());
-                }
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(4.0);
-
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        self.is_open = false;
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let is_valid = !self.form.column_name.trim().is_empty();
-                        let btn = ui.add_enabled(
-                            is_valid && !is_busy,
-                            egui::Button::new(RichText::new("➕ Add Column").strong().color(Color32::WHITE))
-                                .fill(Color32::from_rgb(16, 145, 90))
-                                .rounding(egui::Rounding::same(6.0)),
-                        );
-
-                        if btn.clicked() {
-                            submit_form = Some(self.form.clone());
-                            self.is_open = false;
+                        if ui.text_edit_singleline(&mut self.custom_type).changed() {
+                            self.form.data_type = self.custom_type.clone();
                         }
                     });
+                    ui.end_row();
+
+                    ui.label("Nullable:");
+                    ui.checkbox(
+                        &mut self.form.is_nullable,
+                        "Allow NULL (uncheck for NOT NULL)",
+                    );
+                    ui.end_row();
+
+                    ui.label("Default Value:");
+                    ui.text_edit_singleline(&mut self.form.default_value);
+                    ui.end_row();
+
+                    ui.label("Primary Key:");
+                    ui.checkbox(&mut self.form.is_primary_key, "Set as Primary Key");
+                    ui.end_row();
+                });
+
+            ui.add_space(8.0);
+
+            // SQL Preview
+            let sql_preview = generate_sql_preview(&self.form);
+            ui.label(
+                RichText::new("Generated SQL:")
+                    .size(11.0)
+                    .color(Color32::GRAY),
+            );
+            egui::Frame::none()
+                .fill(Color32::from_rgb(25, 28, 35))
+                .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(50, 55, 65)))
+                .rounding(4.0)
+                .inner_margin(6.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(&sql_preview)
+                            .monospace()
+                            .color(Color32::from_rgb(100, 200, 255)),
+                    );
+                });
+
+            if let Some(err) = &self.error_message {
+                ui.add_space(6.0);
+                ui.label(RichText::new(err).color(Color32::LIGHT_RED).strong());
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    self.is_open = false;
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let is_valid = !self.form.column_name.trim().is_empty();
+                    let btn = ui.add_enabled(
+                        is_valid && !is_busy,
+                        egui::Button::new(
+                            RichText::new("➕ Add Column")
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(16, 145, 90))
+                        .rounding(egui::Rounding::same(6.0)),
+                    );
+
+                    if btn.clicked() {
+                        submit_form = Some(self.form.clone());
+                        self.is_open = false;
+                    }
                 });
             });
+        });
 
         submit_form
     }
 }
 
 fn generate_sql_preview(form: &AddColumnForm) -> String {
-    let col = if form.column_name.is_empty() { "new_column" } else { form.column_name.trim() };
-    let mut sql = format!("ALTER TABLE \"{}\".\"{}\" ADD COLUMN \"{}\" {}", form.schema, form.table, col, form.data_type.trim());
+    let col = if form.column_name.is_empty() {
+        "new_column"
+    } else {
+        form.column_name.trim()
+    };
+    let mut sql = format!(
+        "ALTER TABLE \"{}\".\"{}\" ADD COLUMN \"{}\" {}",
+        form.schema,
+        form.table,
+        col,
+        form.data_type.trim()
+    );
     if !form.default_value.trim().is_empty() {
         sql.push_str(&format!(" DEFAULT {}", form.default_value.trim()));
     }
@@ -223,21 +254,36 @@ impl CreateTableModal {
                     });
 
                 ui.add_space(8.0);
-                let tbl_name = if self.form.table_name.is_empty() { "new_table" } else { self.form.table_name.trim() };
+                let tbl_name = if self.form.table_name.is_empty() {
+                    "new_table"
+                } else {
+                    self.form.table_name.trim()
+                };
                 let sql_preview = if self.form.add_id_pk {
-                    format!("CREATE TABLE \"{}\".\"{}\" (\n    id SERIAL PRIMARY KEY\n);", self.form.schema, tbl_name)
+                    format!(
+                        "CREATE TABLE \"{}\".\"{}\" (\n    id SERIAL PRIMARY KEY\n);",
+                        self.form.schema, tbl_name
+                    )
                 } else {
                     format!("CREATE TABLE \"{}\".\"{}\" ();", self.form.schema, tbl_name)
                 };
 
-                ui.label(RichText::new("Generated SQL:").size(11.0).color(Color32::GRAY));
+                ui.label(
+                    RichText::new("Generated SQL:")
+                        .size(11.0)
+                        .color(Color32::GRAY),
+                );
                 egui::Frame::none()
                     .fill(Color32::from_rgb(25, 28, 35))
                     .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(50, 55, 65)))
                     .rounding(4.0)
                     .inner_margin(6.0)
                     .show(ui, |ui| {
-                        ui.label(RichText::new(&sql_preview).monospace().color(Color32::from_rgb(100, 200, 255)));
+                        ui.label(
+                            RichText::new(&sql_preview)
+                                .monospace()
+                                .color(Color32::from_rgb(100, 200, 255)),
+                        );
                     });
 
                 ui.add_space(10.0);
@@ -253,9 +299,13 @@ impl CreateTableModal {
                         let is_valid = !self.form.table_name.trim().is_empty();
                         let btn = ui.add_enabled(
                             is_valid && !is_busy,
-                            egui::Button::new(RichText::new("➕ Create Table").strong().color(Color32::WHITE))
-                                .fill(Color32::from_rgb(16, 145, 90))
-                                .rounding(egui::Rounding::same(6.0)),
+                            egui::Button::new(
+                                RichText::new("➕ Create Table")
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(Color32::from_rgb(16, 145, 90))
+                            .rounding(egui::Rounding::same(6.0)),
                         );
 
                         if btn.clicked() {
@@ -331,7 +381,8 @@ impl ObjectDdlModal {
                             egui::ComboBox::from_id_salt("ddl_index_method")
                                 .selected_text(&form.index_method)
                                 .show_ui(ui, |ui| {
-                                    for method in ["btree", "hash", "gist", "spgist", "gin", "brin"] {
+                                    for method in ["btree", "hash", "gist", "spgist", "gin", "brin"]
+                                    {
                                         ui.selectable_value(
                                             &mut form.index_method,
                                             method.to_string(),
@@ -496,10 +547,8 @@ impl ObjectDdlModal {
                                 "REFERENCES",
                                 "TRIGGER",
                             ] {
-                                let mut selected = form
-                                    .privileges
-                                    .iter()
-                                    .any(|value| value == privilege);
+                                let mut selected =
+                                    form.privileges.iter().any(|value| value == privilege);
                                 if ui.checkbox(&mut selected, privilege).changed() {
                                     if selected {
                                         form.privileges.push(privilege.to_string());
@@ -512,16 +561,24 @@ impl ObjectDdlModal {
                         if form.revoke {
                             ui.checkbox(&mut form.revoke_cascade, "CASCADE dependent grants");
                         } else {
-                            ui.checkbox(&mut form.grant_option, "Allow grantee to grant these privileges");
+                            ui.checkbox(
+                                &mut form.grant_option,
+                                "Allow grantee to grant these privileges",
+                            );
                         }
                     }
                 }
 
                 ui.add_space(8.0);
                 let preview = form.generate_sql();
-                let mut preview_text =
-                    preview.clone().unwrap_or_else(|error| format!("Cannot generate SQL: {error}"));
-                ui.label(RichText::new("Generated SQL preview").size(11.0).color(Color32::GRAY));
+                let mut preview_text = preview
+                    .clone()
+                    .unwrap_or_else(|error| format!("Cannot generate SQL: {error}"));
+                ui.label(
+                    RichText::new("Generated SQL preview")
+                        .size(11.0)
+                        .color(Color32::GRAY),
+                );
                 egui::Frame::none()
                     .fill(Color32::from_rgb(25, 28, 35))
                     .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(50, 55, 65)))
@@ -530,10 +587,10 @@ impl ObjectDdlModal {
                     .show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut preview_text)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_rows(4)
-                            .desired_width(f32::INFINITY)
-                            .interactive(false),
+                                .font(egui::TextStyle::Monospace)
+                                .desired_rows(4)
+                                .desired_width(f32::INFINITY)
+                                .interactive(false),
                         );
                     });
                 ui.add_space(8.0);
@@ -589,19 +646,62 @@ pub fn render_confirm_dialog(
                     state.action.as_ref(),
                     Some(crate::models::ConfirmAction::RestoreDatabase { .. })
                 );
-                ui.label(RichText::new(if is_restore { "⚠ Confirm Restore" } else { "⚠ Warning" })
+                let is_sql_review = matches!(
+                    state.action.as_ref(),
+                    Some(
+                        crate::models::ConfirmAction::ExecuteSql { .. }
+                            | crate::models::ConfirmAction::ExecuteDdl(_)
+                    )
+                );
+                ui.label(RichText::new(if is_restore {
+                    "⚠ Confirm Restore"
+                } else if is_sql_review {
+                    "⚠ Review SQL"
+                } else {
+                    "⚠ Warning"
+                })
                     .color(Color32::LIGHT_RED).strong().size(16.0));
             });
             ui.separator();
             ui.add_space(6.0);
 
             ui.label(&state.message);
+            let sql_preview = match state.action.as_ref() {
+                Some(crate::models::ConfirmAction::ExecuteSql { sql, .. })
+                | Some(crate::models::ConfirmAction::ExecuteDdl(sql)) => Some(sql),
+                _ => None,
+            };
+            if let Some(sql) = sql_preview {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                        ui.label(RichText::new(sql).monospace());
+                    });
+                });
+            }
             let is_restore = matches!(
                 state.action.as_ref(),
                 Some(crate::models::ConfirmAction::RestoreDatabase { .. })
             );
+            let is_sql_review = matches!(
+                state.action.as_ref(),
+                Some(
+                    crate::models::ConfirmAction::ExecuteSql { .. }
+                        | crate::models::ConfirmAction::ExecuteDdl(_)
+                )
+            );
+            let is_session_change = matches!(
+                state.action.as_ref(),
+                Some(
+                    crate::models::ConfirmAction::DisconnectWithOpenTransaction
+                        | crate::models::ConfirmAction::SwitchDatabaseWithOpenTransaction { .. }
+                )
+            );
             ui.label(RichText::new(if is_restore {
                 "Restoring may permanently change or delete database data."
+            } else if is_sql_review {
+                "Confirm the target and SQL before execution. The database may apply only part of a multi-statement script if an error occurs."
+            } else if is_session_change {
+                "Uncommitted changes will be rolled back when the PostgreSQL session closes."
             } else {
                 "This action is permanent and cannot be undone."
             }).size(11.0).color(Color32::GRAY));
@@ -620,9 +720,31 @@ pub fn render_confirm_dialog(
                         state.action.as_ref(),
                         Some(crate::models::ConfirmAction::RestoreDatabase { .. })
                     );
+                    let is_sql_review = matches!(
+                        state.action.as_ref(),
+                        Some(
+                            crate::models::ConfirmAction::ExecuteSql { .. }
+                                | crate::models::ConfirmAction::ExecuteDdl(_)
+                        )
+                    );
+                    let is_session_change = matches!(
+                        state.action.as_ref(),
+                        Some(
+                            crate::models::ConfirmAction::DisconnectWithOpenTransaction
+                                | crate::models::ConfirmAction::SwitchDatabaseWithOpenTransaction { .. }
+                        )
+                    );
                     let confirm_btn = ui.add_enabled(
                         !is_busy,
-                        egui::Button::new(RichText::new(if is_restore { "Restore Database" } else { "Yes, Delete" })
+                        egui::Button::new(RichText::new(if is_restore {
+                            "Restore Database"
+                        } else if is_sql_review {
+                            "Execute SQL"
+                        } else if is_session_change {
+                            "Continue (roll back)"
+                        } else {
+                            "Yes, Delete"
+                        })
                             .strong().color(Color32::WHITE))
                             .fill(if is_restore { Color32::from_rgb(16, 145, 90) } else { Color32::from_rgb(185, 35, 35) })
                             .rounding(egui::Rounding::same(6.0)),

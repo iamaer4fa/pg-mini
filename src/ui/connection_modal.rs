@@ -7,7 +7,9 @@ pub enum ConnectionModalAction {
         save_error: Option<String>,
     },
     ImportProfiles,
-    ExportProfiles { include_passwords: bool },
+    ExportProfiles {
+        include_passwords: bool,
+    },
 }
 
 pub struct ConnectionModal {
@@ -194,6 +196,30 @@ impl ConnectionModal {
                             });
                             ui.end_row();
                         }
+
+                        ui.label("Statement timeout:");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(
+                                    &mut self.current_cfg.statement_timeout_seconds,
+                                )
+                                .range(0..=86_400)
+                                .suffix(" s"),
+                            );
+                            ui.label("0 = disabled");
+                        });
+                        ui.end_row();
+
+                        ui.label("Lock timeout:");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.current_cfg.lock_timeout_seconds)
+                                    .range(0..=86_400)
+                                    .suffix(" s"),
+                            );
+                            ui.label("0 = disabled");
+                        });
+                        ui.end_row();
                     });
 
                 ui.add_space(8.0);

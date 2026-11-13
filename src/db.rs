@@ -1,12 +1,15 @@
+use futures_util::TryStreamExt;
 use std::future::Future;
 use std::io::BufReader;
+use std::pin::Pin;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
 use std::{
     path::Path,
     process::{Command, Stdio},
 };
-use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
+use tokio::sync::watch;
+use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage, SimpleQueryStream};
 
 use crate::activity::{ActivityLock, ActivitySession, ActivitySnapshot, SizeEntry};
 use crate::ha::provisioning::ProvisioningPreflight;
@@ -18,7 +21,12 @@ use crate::models::{
     DbObjectItem, DbObjectKind, DbObjectRef, EditableCell, ObjectTreeKey, QueryResult, RoleForm,
     RoleItem, TableItem, TlsMode,
 };
+use crate::sql_safety::{
+    transaction_state_after, transaction_state_after_error, validate_read_only_sql,
+};
 use crate::system_stats::{SYSTEM_STATS_FUNCTIONS, SystemStatsSection, SystemStatsSnapshot};
+
+const QUERY_RESULT_PAGE_SIZE: usize = 1_000;
 
 #[derive(Debug)]
 pub enum DbRequest {
@@ -52,7 +60,15 @@ pub enum DbRequest {
         schema: String,
         table: String,
     },
-    ExecuteSql(String),
+    ExecuteSql {
+        query_id: u64,
+        sql: String,
+        read_only: bool,
+    },
+    FetchMoreQueryRows,
+    CancelQuery {
+        query_id: u64,
+    },
     AddColumn(AddColumnForm),
     CreateTable(CreateTableForm),
     DropTable {
@@ -151,6 +167,10 @@ pub enum DbResponse {
     TableDataResult(Result<QueryResult, String>),
     ColumnsFetched(Result<(String, String, Vec<ColumnItem>), String>),
     QueryResult(Result<QueryResult, String>),
+    QueryCancelled {
+        query_id: u64,
+    },
+    TransactionState(bool),
     OperationSuccess {
         message: String,
         refresh_tables: bool,
@@ -163,12 +183,25 @@ pub enum DbResponse {
 pub struct DbWorker {
     req_tx: Sender<DbRequest>,
     res_rx: Receiver<DbResponse>,
+    cancel_tx: watch::Sender<u64>,
+}
+
+struct PendingQuery {
+    query_id: u64,
+    sql: String,
+    stream: Pin<Box<SimpleQueryStream>>,
+    result: QueryResult,
+    buffered_message: Option<SimpleQueryMessage>,
+    cancel_token: CancelToken,
+    read_only: bool,
+    started_at: Instant,
 }
 
 impl DbWorker {
     pub fn new() -> Self {
         let (req_tx, req_rx) = channel::<DbRequest>();
         let (res_tx, res_rx) = channel::<DbResponse>();
+        let (cancel_tx, cancel_rx) = watch::channel(0_u64);
 
         std::thread::Builder::new()
             .name("pg-mini-db-worker".to_string())
@@ -182,6 +215,9 @@ impl DbWorker {
                 rt.block_on(async move {
                     let mut current_client: Option<Client> = None;
                     let mut current_cfg: Option<ConnectionConfig> = None;
+                    let mut pending_query: Option<PendingQuery> = None;
+                    let mut cancel_rx = cancel_rx;
+                    let mut transaction_open = false;
 
                     while let Ok(req) = req_rx.recv() {
                         match req {
@@ -189,6 +225,8 @@ impl DbWorker {
                                 let _ = res_tx.send(DbResponse::Busy(true));
                                 match connect_client(&cfg).await {
                                     Ok((client, version)) => {
+                                        pending_query = None;
+                                        transaction_open = false;
                                         let current_db = cfg.database.clone();
                                         let host_port = format!("{}:{}", cfg.host, cfg.port);
                                         current_client = Some(client);
@@ -209,6 +247,8 @@ impl DbWorker {
                                 let _ = res_tx.send(DbResponse::Busy(false));
                             }
                             DbRequest::Disconnect => {
+                                pending_query = None;
+                                transaction_open = false;
                                 current_client = None;
                                 current_cfg = None;
                                 let _ = res_tx.send(DbResponse::Disconnected);
@@ -353,6 +393,8 @@ impl DbWorker {
                                     cfg.database = db_name.clone();
                                     match connect_client(&cfg).await {
                                         Ok((client, version)) => {
+                                            pending_query = None;
+                                            transaction_open = false;
                                             current_client = Some(client);
                                             current_cfg = Some(cfg);
                                             let _ = res_tx.send(DbResponse::DatabaseSwitched {
@@ -434,16 +476,399 @@ impl DbWorker {
                                     let _ = res_tx.send(DbResponse::Busy(false));
                                 }
                             }
-                            DbRequest::ExecuteSql(sql) => {
-                                if let Some(client) = &current_client {
+                            DbRequest::ExecuteSql {
+                                query_id,
+                                sql,
+                                read_only,
+                            } => {
+                                if pending_query.is_some() {
+                                    let _ = res_tx.send(DbResponse::QueryResult(Err(
+                                        "Fetch the remaining query rows or cancel the query before running another statement."
+                                            .to_string(),
+                                    )));
+                                    continue;
+                                }
+                                if read_only && transaction_open {
+                                    let _ = res_tx.send(DbResponse::QueryResult(Err(
+                                        "Read-only mode cannot start while an explicit transaction is open."
+                                            .to_string(),
+                                    )));
+                                    continue;
+                                }
+                                if let (Some(client), Some(cfg)) =
+                                    (&current_client, &current_cfg)
+                                {
                                     let _ = res_tx.send(DbResponse::Busy(true));
-                                    let result = execute_sql_impl(client, &sql).await;
-                                    let _ = res_tx.send(DbResponse::QueryResult(result));
-                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                    if *cancel_rx.borrow() == query_id {
+                                        let _ = res_tx.send(DbResponse::QueryCancelled { query_id });
+                                        let _ = res_tx.send(DbResponse::Busy(false));
+                                        continue;
+                                    }
+                                    match start_query(client, query_id, &sql, read_only).await {
+                                        Ok(mut pending) => {
+                                            if pending.read_only {
+                                                transaction_open = true;
+                                                let _ = res_tx.send(
+                                                    DbResponse::TransactionState(true),
+                                                );
+                                            }
+                                            match fetch_query_page(
+                                                cfg,
+                                                &mut pending,
+                                                &mut cancel_rx,
+                                            )
+                                            .await
+                                            {
+                                                Ok(has_more) => {
+                                                    pending.result.has_more_rows = has_more;
+                                                    pending.result.execution_time_ms = pending
+                                                        .started_at
+                                                        .elapsed()
+                                                        .as_secs_f64()
+                                                        * 1000.0;
+                                                    transaction_open = if pending.read_only {
+                                                        has_more
+                                                    } else {
+                                                        transaction_state_after(
+                                                            &pending.sql,
+                                                            transaction_open,
+                                                        )
+                                                    };
+                                                    let _ = res_tx.send(
+                                                        DbResponse::TransactionState(
+                                                            transaction_open,
+                                                        ),
+                                                    );
+                                                    if has_more {
+                                                        let _ = res_tx.send(
+                                                            DbResponse::QueryResult(Ok(
+                                                                pending.result.clone(),
+                                                            )),
+                                                        );
+                                                        pending_query = Some(pending);
+                                                        let _ = res_tx.send(DbResponse::Busy(true));
+                                                    } else if pending.read_only {
+                                                        match finish_read_only_query(client).await {
+                                                            Ok(()) => {
+                                                                transaction_open = false;
+                                                                let _ = res_tx.send(
+                                                                    DbResponse::TransactionState(
+                                                                        false,
+                                                                    ),
+                                                                );
+                                                                let _ = res_tx.send(
+                                                                    DbResponse::QueryResult(Ok(
+                                                                        pending.result,
+                                                                    )),
+                                                                );
+                                                                let _ = res_tx.send(
+                                                                    DbResponse::Busy(false),
+                                                                );
+                                                            }
+                                                            Err(error) => {
+                                                                let _ = res_tx.send(
+                                                                    DbResponse::QueryResult(Err(
+                                                                        error,
+                                                                    )),
+                                                                );
+                                                                let _ = res_tx.send(
+                                                                    DbResponse::Busy(false),
+                                                                );
+                                                            }
+                                                        }
+                                                    } else {
+                                                        let _ = res_tx.send(
+                                                            DbResponse::QueryResult(Ok(
+                                                                pending.result,
+                                                            )),
+                                                        );
+                                                        let _ = res_tx.send(DbResponse::Busy(false));
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    if error == "Query cancelled by user." {
+                                                        if pending.read_only {
+                                                            match finish_read_only_query(client).await {
+                                                                Ok(()) => {
+                                                                    transaction_open = false;
+                                                                    let _ = res_tx.send(
+                                                                        DbResponse::TransactionState(
+                                                                            false,
+                                                                        ),
+                                                                    );
+                                                                    let _ = res_tx.send(
+                                                                        DbResponse::QueryCancelled {
+                                                                            query_id,
+                                                                        },
+                                                                    );
+                                                                }
+                                                                Err(error) => {
+                                                                    let _ = res_tx.send(
+                                                                        DbResponse::OperationFailed(
+                                                                            format!(
+                                                                                "Query was cancelled, but the read-only transaction could not be rolled back: {error}"
+                                                                            ),
+                                                                        ),
+                                                                    );
+                                                                }
+                                                            }
+                                                        } else {
+                                                            let was_open = transaction_open;
+                                                            transaction_open = transaction_state_after_error(
+                                                                &pending.sql,
+                                                                transaction_open,
+                                                            );
+                                                            if transaction_open != was_open {
+                                                                let _ = res_tx.send(
+                                                                    DbResponse::TransactionState(
+                                                                        transaction_open,
+                                                                    ),
+                                                                );
+                                                            }
+                                                            let _ = res_tx.send(
+                                                                DbResponse::QueryCancelled {
+                                                                    query_id,
+                                                                },
+                                                            );
+                                                        }
+                                                        let _ =
+                                                            res_tx.send(DbResponse::Busy(false));
+                                                        continue;
+                                                    }
+                                                    let error = if pending.read_only {
+                                                        match finish_read_only_query(client).await {
+                                                            Ok(()) => {
+                                                                transaction_open = false;
+                                                                let _ = res_tx.send(
+                                                                    DbResponse::TransactionState(
+                                                                        false,
+                                                                    ),
+                                                                );
+                                                                error
+                                                            }
+                                                            Err(rollback_error) => format!(
+                                                                "{error}; additionally failed to roll back the read-only transaction: {rollback_error}"
+                                                            ),
+                                                        }
+                                                    } else {
+                                                        error
+                                                    };
+                                                    if !pending.read_only {
+                                                        transaction_open = transaction_state_after_error(
+                                                            &pending.sql,
+                                                            transaction_open,
+                                                        );
+                                                        let _ = res_tx.send(
+                                                            DbResponse::TransactionState(
+                                                                transaction_open,
+                                                            ),
+                                                        );
+                                                    }
+                                                    let _ = res_tx.send(DbResponse::QueryResult(
+                                                        Err(error),
+                                                    ));
+                                                    let _ = res_tx.send(DbResponse::Busy(false));
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let _ = res_tx.send(DbResponse::QueryResult(Err(
+                                                error,
+                                            )));
+                                            let _ = res_tx.send(DbResponse::Busy(false));
+                                        }
+                                    }
                                 } else {
                                     let _ = res_tx.send(DbResponse::QueryResult(Err(
                                         "Not connected to any PostgreSQL database".to_string(),
                                     )));
+                                }
+                            }
+                            DbRequest::FetchMoreQueryRows => {
+                                if let (Some(client), Some(cfg), Some(mut pending)) =
+                                    (&current_client, &current_cfg, pending_query.take())
+                                {
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    match fetch_query_page(cfg, &mut pending, &mut cancel_rx).await {
+                                        Ok(has_more) => {
+                                            pending.result.has_more_rows = has_more;
+                                            pending.result.execution_time_ms = pending
+                                                .started_at
+                                                .elapsed()
+                                                .as_secs_f64()
+                                                * 1000.0;
+                                            if has_more {
+                                                let _ = res_tx.send(DbResponse::QueryResult(Ok(
+                                                    pending.result.clone(),
+                                                )));
+                                                pending_query = Some(pending);
+                                                let _ = res_tx.send(DbResponse::Busy(true));
+                                            } else if pending.read_only {
+                                                match finish_read_only_query(client).await {
+                                                    Ok(()) => {
+                                                        transaction_open = false;
+                                                        let _ = res_tx.send(
+                                                            DbResponse::TransactionState(false),
+                                                        );
+                                                        let _ = res_tx.send(
+                                                            DbResponse::QueryResult(Ok(
+                                                                pending.result,
+                                                            )),
+                                                        );
+                                                        let _ = res_tx.send(
+                                                            DbResponse::Busy(false),
+                                                        );
+                                                    }
+                                                    Err(error) => {
+                                                        let _ = res_tx.send(
+                                                            DbResponse::QueryResult(Err(error)),
+                                                        );
+                                                        let _ = res_tx.send(
+                                                            DbResponse::Busy(false),
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                let _ = res_tx.send(DbResponse::QueryResult(Ok(
+                                                    pending.result,
+                                                )));
+                                                let _ = res_tx.send(DbResponse::Busy(false));
+                                            }
+                                        }
+                                        Err(error) => {
+                                            if error == "Query cancelled by user." {
+                                                if pending.read_only {
+                                                    match finish_read_only_query(client).await {
+                                                        Ok(()) => {
+                                                            transaction_open = false;
+                                                            let _ = res_tx.send(
+                                                                DbResponse::TransactionState(false),
+                                                            );
+                                                            let _ = res_tx.send(
+                                                                DbResponse::QueryCancelled {
+                                                                    query_id: pending.query_id,
+                                                                },
+                                                            );
+                                                        }
+                                                        Err(error) => {
+                                                            let _ = res_tx.send(
+                                                                DbResponse::OperationFailed(
+                                                                    format!(
+                                                                        "Query was cancelled, but the read-only transaction could not be rolled back: {error}"
+                                                                    ),
+                                                                ),
+                                                            );
+                                                        }
+                                                    }
+                                                } else {
+                                                    let was_open = transaction_open;
+                                                    transaction_open = transaction_state_after_error(
+                                                        &pending.sql,
+                                                        transaction_open,
+                                                    );
+                                                    if transaction_open != was_open {
+                                                        let _ = res_tx.send(
+                                                            DbResponse::TransactionState(
+                                                                transaction_open,
+                                                            ),
+                                                        );
+                                                    }
+                                                    let _ = res_tx.send(
+                                                        DbResponse::QueryCancelled {
+                                                            query_id: pending.query_id,
+                                                        },
+                                                    );
+                                                }
+                                                let _ = res_tx.send(DbResponse::Busy(false));
+                                                continue;
+                                            }
+                                            let error = if pending.read_only {
+                                                match finish_read_only_query(client).await {
+                                                    Ok(()) => {
+                                                        transaction_open = false;
+                                                        let _ = res_tx.send(
+                                                            DbResponse::TransactionState(false),
+                                                        );
+                                                        error
+                                                    }
+                                                    Err(rollback_error) => format!(
+                                                        "{error}; additionally failed to roll back the read-only transaction: {rollback_error}"
+                                                    ),
+                                                }
+                                            } else {
+                                                transaction_open = transaction_state_after_error(
+                                                    &pending.sql,
+                                                    transaction_open,
+                                                );
+                                                let _ = res_tx.send(
+                                                    DbResponse::TransactionState(transaction_open),
+                                                );
+                                                error
+                                            };
+                                            let _ = res_tx.send(DbResponse::QueryResult(Err(
+                                                error,
+                                            )));
+                                            let _ = res_tx.send(DbResponse::Busy(false));
+                                        }
+                                    }
+                                }
+                            }
+                            DbRequest::CancelQuery { query_id } => {
+                                if let (Some(client), Some(cfg), Some(mut pending)) =
+                                    (&current_client, &current_cfg, pending_query.take())
+                                {
+                                    if pending.query_id != query_id {
+                                        pending_query = Some(pending);
+                                        continue;
+                                    }
+                                    let _ = res_tx.send(DbResponse::Busy(true));
+                                    match cancel_pending_query(cfg, &mut pending).await {
+                                        Ok(()) => {
+                                            if pending.read_only {
+                                                match finish_read_only_query(client).await {
+                                                    Ok(()) => {
+                                                        transaction_open = false;
+                                                        let _ = res_tx.send(
+                                                            DbResponse::TransactionState(false),
+                                                        );
+                                                        let _ = res_tx.send(
+                                                            DbResponse::QueryCancelled { query_id },
+                                                        );
+                                                    }
+                                                    Err(error) => {
+                                                        let _ = res_tx.send(
+                                                            DbResponse::OperationFailed(format!(
+                                                                "Query was cancelled, but the read-only transaction could not be rolled back: {error}"
+                                                            )),
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                let was_open = transaction_open;
+                                                transaction_open = transaction_state_after_error(
+                                                    &pending.sql,
+                                                    transaction_open,
+                                                );
+                                                if transaction_open != was_open {
+                                                    let _ = res_tx.send(
+                                                        DbResponse::TransactionState(
+                                                            transaction_open,
+                                                        ),
+                                                    );
+                                                }
+                                                let _ = res_tx
+                                                    .send(DbResponse::QueryCancelled { query_id });
+                                            }
+                                            let _ = res_tx.send(DbResponse::Busy(false));
+                                        }
+                                        Err(error) => {
+                                            pending_query = Some(pending);
+                                            let _ = res_tx.send(DbResponse::OperationFailed(
+                                                format!("Could not cancel query: {error}"),
+                                            ));
+                                            let _ = res_tx.send(DbResponse::Busy(true));
+                                        }
+                                    }
                                 }
                             }
                             DbRequest::AddColumn(form) => {
@@ -817,11 +1242,20 @@ impl DbWorker {
             })
             .expect("Failed to spawn db worker thread");
 
-        Self { req_tx, res_rx }
+        Self {
+            req_tx,
+            res_rx,
+            cancel_tx,
+        }
     }
 
     pub fn send(&self, req: DbRequest) {
         let _ = self.req_tx.send(req);
+    }
+
+    pub fn cancel_query(&self, query_id: u64) {
+        self.cancel_tx.send_replace(query_id);
+        let _ = self.req_tx.send(DbRequest::CancelQuery { query_id });
     }
 
     pub fn try_recv(&self) -> Option<DbResponse> {
@@ -1147,6 +1581,11 @@ fn postgres_config(cfg: &ConnectionConfig) -> tokio_postgres::Config {
     }
     pg_config.dbname(&cfg.database);
     pg_config.connect_timeout(std::time::Duration::from_secs(8));
+    pg_config.options(&format!(
+        "-c statement_timeout={}ms -c lock_timeout={}ms",
+        cfg.statement_timeout_seconds.saturating_mul(1_000),
+        cfg.lock_timeout_seconds.saturating_mul(1_000)
+    ));
     pg_config
 }
 
@@ -2075,63 +2514,208 @@ async fn fetch_table_data_impl(
 }
 
 async fn execute_sql_impl(client: &Client, sql: &str) -> Result<QueryResult, String> {
-    let start = Instant::now();
-    let messages = client
-        .simple_query(sql)
-        .await
-        .map_err(|e| format!("Query error: {}", e))?;
+    let (_cancel_tx, mut cancel_rx) = watch::channel(0_u64);
+    let mut pending = start_query(client, 0, sql, false).await?;
+    let cfg = ConnectionConfig {
+        tls_mode: TlsMode::Disable,
+        ..ConnectionConfig::default()
+    };
+    let has_more = fetch_query_page(&cfg, &mut pending, &mut cancel_rx).await?;
+    pending.result.has_more_rows = has_more;
+    pending.result.execution_time_ms = pending.started_at.elapsed().as_secs_f64() * 1000.0;
+    Ok(pending.result)
+}
 
-    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+async fn start_query(
+    client: &Client,
+    query_id: u64,
+    sql: &str,
+    read_only: bool,
+) -> Result<PendingQuery, String> {
+    if read_only {
+        validate_read_only_sql(sql)?;
+        client
+            .batch_execute("BEGIN READ ONLY")
+            .await
+            .map_err(|error| format!("Could not start read-only transaction: {error}"))?;
+    }
 
-    let mut columns = Vec::new();
-    let mut rows = Vec::new();
-    let mut rows_affected = None;
-    let mut got_headers = false;
-
-    for msg in messages {
-        match msg {
-            SimpleQueryMessage::Row(row) => {
-                if !got_headers {
-                    for col in row.columns() {
-                        columns.push(col.name().to_string());
-                    }
-                    got_headers = true;
+    let stream = match client.simple_query_raw(sql).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            if read_only {
+                if let Err(rollback_error) = finish_read_only_query(client).await {
+                    return Err(format!(
+                        "Query error: {error}; additionally failed to roll back the read-only transaction: {rollback_error}"
+                    ));
                 }
+            }
+            return Err(format!("Query error: {error}"));
+        }
+    };
 
-                let mut row_vals = Vec::with_capacity(columns.len());
-                for i in 0..columns.len() {
-                    if let Some(val) = row.get(i) {
-                        let is_num = val.parse::<f64>().is_ok();
-                        if is_num {
-                            row_vals.push(CellValue::new_number(val));
-                        } else {
-                            row_vals.push(CellValue::new_text(val));
-                        }
-                    } else {
-                        row_vals.push(CellValue::new_null());
-                    }
-                }
-                rows.push(row_vals);
-            }
-            SimpleQueryMessage::CommandComplete(count) => {
-                rows_affected = Some(count);
-            }
-            _ => {}
+    Ok(PendingQuery {
+        query_id,
+        sql: sql.to_string(),
+        stream: Box::pin(stream),
+        result: QueryResult {
+            query: sql.to_string(),
+            ..QueryResult::empty()
+        },
+        buffered_message: None,
+        cancel_token: client.cancel_token(),
+        read_only,
+        started_at: Instant::now(),
+    })
+}
+
+async fn fetch_query_page(
+    cfg: &ConnectionConfig,
+    pending: &mut PendingQuery,
+    cancel_rx: &mut watch::Receiver<u64>,
+) -> Result<bool, String> {
+    let mut rows_in_page = 0;
+    while rows_in_page < QUERY_RESULT_PAGE_SIZE {
+        let Some(message) = next_query_message(cfg, pending, cancel_rx).await? else {
+            finalize_query_result(&mut pending.result);
+            return Ok(false);
+        };
+        let is_row = matches!(&message, SimpleQueryMessage::Row(_));
+        append_query_message(&mut pending.result, message);
+        if is_row {
+            rows_in_page += 1;
         }
     }
 
-    let is_select = got_headers || rows_affected.is_none();
-    let col_count = columns.len();
+    loop {
+        match next_query_message(cfg, pending, cancel_rx).await? {
+            Some(message @ SimpleQueryMessage::Row(_)) => {
+                pending.buffered_message = Some(message);
+                return Ok(true);
+            }
+            Some(message) => append_query_message(&mut pending.result, message),
+            None => {
+                finalize_query_result(&mut pending.result);
+                return Ok(false);
+            }
+        }
+    }
+}
 
-    Ok(QueryResult {
-        query: sql.to_string(),
-        columns,
-        column_types: vec!["text".to_string(); col_count],
-        rows,
-        rows_affected,
-        execution_time_ms: elapsed,
-        is_select,
-    })
+async fn next_query_message(
+    cfg: &ConnectionConfig,
+    pending: &mut PendingQuery,
+    cancel_rx: &mut watch::Receiver<u64>,
+) -> Result<Option<SimpleQueryMessage>, String> {
+    if let Some(message) = pending.buffered_message.take() {
+        return Ok(Some(message));
+    }
+    loop {
+        tokio::select! {
+            result = pending.stream.try_next() => {
+                return result.map_err(|error| format!("Query error: {error}"));
+            }
+            changed = cancel_rx.changed() => {
+                changed.map_err(|_| "Query cancellation channel closed".to_string())?;
+                if *cancel_rx.borrow() != pending.query_id {
+                    continue;
+                }
+                send_query_cancel(cfg, &pending.cancel_token)
+                    .await
+                    .map_err(|error| format!("Could not send query cancellation request: {error}"))?;
+                loop {
+                    match pending.stream.try_next().await {
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                return Err("Query cancelled by user.".to_string());
+            }
+        }
+    }
+}
+
+fn append_query_message(result: &mut QueryResult, message: SimpleQueryMessage) {
+    match message {
+        SimpleQueryMessage::Row(row) => {
+            if result.columns.is_empty() {
+                result.columns = row
+                    .columns()
+                    .iter()
+                    .map(|column| column.name().to_string())
+                    .collect();
+                result.column_types = vec!["text".to_string(); result.columns.len()];
+            }
+            let values = (0..result.columns.len())
+                .map(|index| match row.get(index) {
+                    Some(value) if value.parse::<f64>().is_ok() => CellValue::new_number(value),
+                    Some(value) => CellValue::new_text(value),
+                    None => CellValue::new_null(),
+                })
+                .collect();
+            result.rows.push(values);
+        }
+        SimpleQueryMessage::CommandComplete(count) => result.rows_affected = Some(count),
+        _ => {}
+    }
+}
+
+fn finalize_query_result(result: &mut QueryResult) {
+    result.is_select = !result.columns.is_empty() || result.rows_affected.is_none();
+    result.has_more_rows = false;
+}
+
+async fn finish_read_only_query(client: &Client) -> Result<(), String> {
+    client
+        .batch_execute("ROLLBACK")
+        .await
+        .map_err(|error| format!("Failed to roll back read-only transaction: {error}"))
+}
+
+async fn cancel_pending_query(
+    cfg: &ConnectionConfig,
+    pending: &mut PendingQuery,
+) -> Result<(), String> {
+    send_query_cancel(cfg, &pending.cancel_token)
+        .await
+        .map_err(|error| error.to_string())?;
+    loop {
+        match pending.stream.try_next().await {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
+async fn send_query_cancel(
+    cfg: &ConnectionConfig,
+    cancel_token: &CancelToken,
+) -> Result<(), String> {
+    match cfg.tls_mode {
+        TlsMode::Disable => cancel_token
+            .cancel_query(NoTls)
+            .await
+            .map_err(|error| error.to_string()),
+        TlsMode::Prefer => {
+            if let Ok(tls) = tls_connector(cfg) {
+                if cancel_token.cancel_query(tls).await.is_ok() {
+                    return Ok(());
+                }
+            }
+            cancel_token
+                .cancel_query(NoTls)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        TlsMode::Require => {
+            let tls = tls_connector(cfg)?;
+            cancel_token
+                .cancel_query(tls)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
 }
 
 async fn add_column_impl(client: &Client, form: &AddColumnForm) -> Result<String, String> {

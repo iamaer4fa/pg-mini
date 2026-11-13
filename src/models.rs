@@ -33,6 +33,18 @@ pub struct ConnectionConfig {
     pub tls_mode: TlsMode,
     #[serde(default)]
     pub tls_root_cert: String,
+    #[serde(default = "default_statement_timeout_seconds")]
+    pub statement_timeout_seconds: u32,
+    #[serde(default = "default_lock_timeout_seconds")]
+    pub lock_timeout_seconds: u32,
+}
+
+fn default_statement_timeout_seconds() -> u32 {
+    60
+}
+
+fn default_lock_timeout_seconds() -> u32 {
+    5
 }
 
 impl Default for ConnectionConfig {
@@ -47,6 +59,8 @@ impl Default for ConnectionConfig {
             password: String::new(),
             tls_mode: TlsMode::Disable,
             tls_root_cert: String::new(),
+            statement_timeout_seconds: default_statement_timeout_seconds(),
+            lock_timeout_seconds: default_lock_timeout_seconds(),
         }
     }
 }
@@ -117,6 +131,7 @@ pub struct QueryResult {
     pub rows_affected: Option<u64>,
     pub execution_time_ms: f64,
     pub is_select: bool,
+    pub has_more_rows: bool,
 }
 
 impl QueryResult {
@@ -129,6 +144,7 @@ impl QueryResult {
             rows_affected: None,
             execution_time_ms: 0.0,
             is_select: true,
+            has_more_rows: false,
         }
     }
 }
@@ -600,6 +616,15 @@ pub enum ConfirmAction {
         db_name: String,
         file_path: std::path::PathBuf,
     },
+    ExecuteSql {
+        sql: String,
+        read_only: bool,
+    },
+    ExecuteDdl(String),
+    SwitchDatabaseWithOpenTransaction {
+        db_name: String,
+    },
+    DisconnectWithOpenTransaction,
     DropObject {
         object: DbObjectRef,
     },
@@ -663,7 +688,17 @@ impl Default for AppConfig {
 
 #[cfg(test)]
 mod object_browser_tests {
-    use super::{DbObjectKind, DbObjectRef};
+    use super::{ConnectionConfig, DbObjectKind, DbObjectRef};
+
+    #[test]
+    fn older_connection_profiles_get_safe_query_timeouts() {
+        let profile: ConnectionConfig = serde_json::from_str(
+            r#"{"id":"legacy","name":"legacy","host":"localhost","port":5432,"database":"postgres","username":"postgres","password":""}"#,
+        )
+        .unwrap();
+        assert_eq!(profile.statement_timeout_seconds, 60);
+        assert_eq!(profile.lock_timeout_seconds, 5);
+    }
 
     #[test]
     fn object_sql_quotes_identifiers_and_targets_overloads() {

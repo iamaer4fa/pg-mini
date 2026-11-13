@@ -138,6 +138,7 @@ pub struct SqlEditor {
     pub selected_history_idx: Option<usize>,
     pub data_state: DataTableState,
     pub editor_height: f32,
+    pub read_only_mode: bool,
     show_completions: bool,
 }
 
@@ -150,13 +151,16 @@ impl Default for SqlEditor {
             selected_history_idx: None,
             data_state: DataTableState::default(),
             editor_height: 180.0,
+            read_only_mode: false,
             show_completions: false,
         }
     }
 }
 
 pub enum SqlEditorAction {
-    ExecuteQuery(String),
+    ExecuteQuery { sql: String, read_only: bool },
+    FetchMoreRows,
+    CancelQuery,
     CopyCell(String),
     ExportCsv,
     CopyQuery(String),
@@ -169,6 +173,10 @@ impl SqlEditor {
         last_result: &Option<Result<QueryResult, String>>,
         is_connected: bool,
         is_busy: bool,
+        query_running: bool,
+        transaction_open: bool,
+        statement_timeout_seconds: u32,
+        lock_timeout_seconds: u32,
         tables: &[TableItem],
         columns: &[ColumnItem],
     ) -> Option<SqlEditorAction> {
@@ -181,21 +189,92 @@ impl SqlEditor {
         if ctrl_enter && is_connected && !is_busy && !self.sql_text.trim().is_empty() {
             let query = self.sql_text.trim().to_string();
             self.add_history(&query);
-            return Some(SqlEditorAction::ExecuteQuery(query));
+            return Some(SqlEditorAction::ExecuteQuery {
+                sql: query,
+                read_only: self.read_only_mode,
+            });
         }
+
+        let has_more_rows = last_result
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .is_some_and(|result| result.has_more_rows);
 
         ui.horizontal(|ui| {
             let run = ui.add_enabled(
-                is_connected && !is_busy && !self.sql_text.trim().is_empty(),
-                egui::Button::new(RichText::new(if is_busy { "⏳ Running..." } else { "▶ Run Query (Ctrl+Enter)" }).strong().color(Color32::WHITE))
+                is_connected && !is_busy && !has_more_rows && !self.sql_text.trim().is_empty(),
+                egui::Button::new(RichText::new(if has_more_rows {
+                    "⏸ Results Paused"
+                } else if is_busy {
+                    "⏳ Running..."
+                } else {
+                    "▶ Run Query (Ctrl+Enter)"
+                }).strong().color(Color32::WHITE))
                     .fill(Color32::from_rgb(16, 145, 90)),
             );
             if run.clicked() {
                 let query = self.sql_text.trim().to_string();
                 self.add_history(&query);
-                action = Some(SqlEditorAction::ExecuteQuery(query));
+                action = Some(SqlEditorAction::ExecuteQuery {
+                    sql: query,
+                    read_only: self.read_only_mode,
+                });
+            }
+            if query_running || has_more_rows {
+                if ui
+                    .add_enabled(query_running || has_more_rows, egui::Button::new("■ Cancel"))
+                    .on_hover_text("Cancel the running query or discard its remaining rows")
+                    .clicked()
+                {
+                    action = Some(SqlEditorAction::CancelQuery);
+                }
+                if has_more_rows
+                    && ui.add_enabled(!query_running, egui::Button::new("Fetch more rows"))
+                        .on_hover_text("Fetch the next 1,000 rows from this query")
+                        .clicked()
+                {
+                    action = Some(SqlEditorAction::FetchMoreRows);
+                }
             }
             if ui.button("Clear").clicked() { self.sql_text.clear(); }
+            ui.add_enabled_ui(!is_busy && !transaction_open, |ui| {
+                ui.checkbox(&mut self.read_only_mode, "Read-only transaction")
+                    .on_hover_text("Runs the query in a server-enforced READ ONLY transaction and rolls it back when complete");
+            });
+            ui.separator();
+            if !transaction_open {
+                if ui.add_enabled(is_connected && !is_busy, egui::Button::new("BEGIN")).clicked() {
+                    action = Some(SqlEditorAction::ExecuteQuery {
+                        sql: "BEGIN;".to_string(),
+                        read_only: false,
+                    });
+                }
+            } else {
+                if ui.add_enabled(is_connected && !is_busy, egui::Button::new("COMMIT")).clicked() {
+                    action = Some(SqlEditorAction::ExecuteQuery {
+                        sql: "COMMIT;".to_string(),
+                        read_only: false,
+                    });
+                }
+                if ui.add_enabled(is_connected && !is_busy, egui::Button::new("ROLLBACK")).clicked() {
+                    action = Some(SqlEditorAction::ExecuteQuery {
+                        sql: "ROLLBACK;".to_string(),
+                        read_only: false,
+                    });
+                }
+            }
+            if transaction_open {
+                ui.label(RichText::new("Transaction open").color(Color32::YELLOW).strong());
+            }
+            ui.label(
+                RichText::new(format!(
+                    "Timeouts: statement {}s / lock {}s",
+                    if statement_timeout_seconds == 0 { "off".to_string() } else { statement_timeout_seconds.to_string() },
+                    if lock_timeout_seconds == 0 { "off".to_string() } else { lock_timeout_seconds.to_string() }
+                ))
+                .small()
+                .color(Color32::GRAY),
+            );
             if ui.button("Completion (Ctrl+Space)").clicked() { self.show_completions = !self.show_completions; }
             ui.separator();
             egui::ComboBox::from_id_salt("sql_templates")
@@ -217,7 +296,10 @@ impl SqlEditor {
                 if let Some(query) = prepare_query_plan(&self.sql_text) {
                     self.sql_text = query.clone();
                     self.add_history(&query);
-                    action = Some(SqlEditorAction::ExecuteQuery(query));
+                    action = Some(SqlEditorAction::ExecuteQuery {
+                        sql: query,
+                        read_only: self.read_only_mode,
+                    });
                 }
             }
             egui::ComboBox::from_id_salt("admin_insights")
@@ -229,7 +311,10 @@ impl SqlEditor {
                             let query = sql.to_string();
                             self.sql_text = query.clone();
                             self.add_history(&query);
-                            action = Some(SqlEditorAction::ExecuteQuery(query));
+                            action = Some(SqlEditorAction::ExecuteQuery {
+                                sql: query,
+                                read_only: self.read_only_mode,
+                            });
                             ui.close_menu();
                         }
                     }
@@ -346,10 +431,7 @@ impl SqlEditor {
             });
 
         let resize_handle = ui
-            .allocate_response(
-                egui::vec2(ui.available_width(), 8.0),
-                egui::Sense::drag(),
-            )
+            .allocate_response(egui::vec2(ui.available_width(), 8.0), egui::Sense::drag())
             .on_hover_cursor(egui::CursorIcon::ResizeVertical)
             .on_hover_text("Drag to resize the SQL editor");
         if resize_handle.dragged() {
@@ -363,8 +445,14 @@ impl SqlEditor {
         };
         ui.painter().line_segment(
             [
-                egui::pos2(resize_handle.rect.left() + 6.0, resize_handle.rect.center().y),
-                egui::pos2(resize_handle.rect.right() - 6.0, resize_handle.rect.center().y),
+                egui::pos2(
+                    resize_handle.rect.left() + 6.0,
+                    resize_handle.rect.center().y,
+                ),
+                egui::pos2(
+                    resize_handle.rect.right() - 6.0,
+                    resize_handle.rect.center().y,
+                ),
             ],
             egui::Stroke::new(2.0_f32, handle_color),
         );
@@ -402,6 +490,16 @@ impl SqlEditor {
         ui.add_space(4.0);
         match last_result {
             Some(Ok(res)) => {
+                if res.has_more_rows {
+                    ui.label(
+                        RichText::new(format!(
+                            "Showing {} rows; more results are available. Fetch the next batch or cancel the query.",
+                            res.rows.len()
+                        ))
+                        .small()
+                        .color(Color32::YELLOW),
+                    );
+                }
                 if let Some(table_act) =
                     render_data_table(ui, &mut self.data_state, res, false, None, &[], false)
                 {

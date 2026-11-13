@@ -50,6 +50,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 - **Multiple Live Servers**: Connect to several PostgreSQL servers at once, switch the active server from the top bar, and keep each server connected while working with another.
 - **Profile Management**: Save and switch between multiple PostgreSQL connection profiles (Host, Port, Database, Username, Password).
 - **TLS Connections**: Disable TLS, prefer TLS with an explicit plaintext fallback, or require verified TLS. Verification uses the operating system trust store and optionally an additional PEM CA certificate.
+- **Per-Profile Query Timeouts**: Configure PostgreSQL `statement_timeout` and `lock_timeout` for each connection profile (defaults: 60 seconds and 5 seconds; set either to `0` to disable).
 - **Portable Profiles**: Import and export connection profiles as versioned JSON. Passwords are excluded by default; enabling password export stores them as plaintext in the JSON file.
 - **Persistent Storage**: Saved connections and settings are automatically stored in `~/.config/pg-mini/config.json`.
 - **Show/Hide Password**: Quick toggle to verify database passwords.
@@ -100,6 +101,9 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 - **SQL Syntax Highlighting**: Highlights SQL keywords, strings, numbers, and line comments in the editor.
 - **Schema-Aware Completion**: Press `Ctrl + Space` to complete SQL keywords, loaded table names, qualified schema/table names, and columns from the selected table.
 - **Keyboard Execution**: Run queries with `Ctrl + Enter` (or `F5`).
+- **Safe Query Controls**: Cancel running SQL, run a query in a server-enforced read-only transaction, and use explicit `BEGIN`, `COMMIT`, and `ROLLBACK` controls. Open transactions are shown and trigger a warning before closing pg-mini, disconnecting, or switching databases.
+- **Bounded Results**: SQL results are fetched in batches of up to 1,000 rows. Fetch more or cancel instead of loading an unbounded result in one step.
+- **State-Changing SQL Review**: Recognized DDL/DML, administrative statements, and generated schema changes show the target and SQL for confirmation before execution.
 - **Performance Timer**: Displays query execution time in milliseconds and row counts (`⚡ 3.4 ms | 120 rows returned`).
 - **Quick Snippets**: Dropdown with ready-to-use SQL templates (Server Info, Database Sizes, Table Counts, etc.).
 - **pgAdmin-Style Admin Insights**: One-click query plans (`EXPLAIN`, without executing the query), active sessions, blocked sessions, database statistics, and database roles in the normal result grid.
@@ -180,7 +184,7 @@ Build a Debian package (including the desktop launcher and lightning icon):
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./target/debian/pg-mini_0.1.13_amd64.deb
+sudo apt install ./target/debian/pg-mini_0.1.14_amd64.deb
 ```
 
 The package installs the app to `/usr/bin/pg-mini`, registers it in the desktop application launcher, and installs the icon in the hicolor icon theme.
@@ -194,7 +198,7 @@ RPM packages are built on Rocky Linux 9 for x86_64 and target RHEL 9-compatible 
 On a supported distribution, install the downloaded package with:
 
 ```bash
-sudo dnf install ./pg-mini-0.1.13-1.el9.x86_64.rpm
+sudo dnf install ./pg-mini-0.1.14-1.el9.x86_64.rpm
 ```
 
 To build the RPM locally on a Rocky Linux 9-compatible build environment, install Rust, the Linux GUI development libraries, and `rpm-build`, then run:
@@ -209,11 +213,11 @@ The generated RPM is placed in `target/rpm/`.
 
 ## 🚀 Build Packages on GitHub
 
-The GitHub Actions workflow builds the Ubuntu `.deb`, a RHEL-compatible `.rpm`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.13`):
+The GitHub Actions workflow builds the Ubuntu `.deb`, a RHEL-compatible `.rpm`, a portable Windows `.exe`, a Windows setup installer, and macOS disk images for Apple silicon and Intel Macs. To build them, push a version tag matching `Cargo.toml` (currently `v0.1.14`):
 
 ```bash
-git tag v0.1.13
-git push origin v0.1.13
+git tag v0.1.14
+git push origin v0.1.14
 ```
 
 Once all platform builds finish, GitHub publishes a Release with the Linux, Windows, and macOS downloads. To build without publishing a Release, run **Build release packages** from the repository's **Actions** tab; the outputs will be available as workflow artifacts.

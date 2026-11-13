@@ -1,10 +1,17 @@
+use crate::models::ColumnItem;
 use egui::{Color32, RichText, Ui};
 use egui_extras::{Column, TableBuilder};
-use crate::models::ColumnItem;
 
 pub enum ColumnsViewAction {
-    OpenAddColumn { schema: String, table: String },
-    ConfirmDropColumn { schema: String, table: String, column: String },
+    OpenAddColumn {
+        schema: String,
+        table: String,
+    },
+    ConfirmDropColumn {
+        schema: String,
+        table: String,
+        column: String,
+    },
     CopyName(String),
 }
 
@@ -21,11 +28,16 @@ pub fn render_columns_view(
         ui.heading(RichText::new(format!("📐 Schema: {}.{}", schema, table)).size(16.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if !table.is_empty() {
-                if ui.add(
-                    egui::Button::new(RichText::new("➕ Add Column...").strong().color(Color32::WHITE))
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("➕ Add Column...")
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
                         .fill(Color32::from_rgb(16, 145, 90)),
-                )
-                .clicked()
+                    )
+                    .clicked()
                 {
                     action = Some(ColumnsViewAction::OpenAddColumn {
                         schema: schema.to_string(),
@@ -76,13 +88,27 @@ pub fn render_columns_view(
         .column(Column::initial(150.0).at_least(80.0).resizable(true)) // Default
         .column(Column::auto().at_least(70.0)) // Actions
         .header(24.0, |mut header| {
-            header.col(|ui| { ui.strong("#"); });
-            header.col(|ui| { ui.strong("Column Name"); });
-            header.col(|ui| { ui.strong("Data Type"); });
-            header.col(|ui| { ui.strong("PK"); });
-            header.col(|ui| { ui.strong("Nullable"); });
-            header.col(|ui| { ui.strong("Default Value"); });
-            header.col(|ui| { ui.strong("Actions"); });
+            header.col(|ui| {
+                ui.strong("#");
+            });
+            header.col(|ui| {
+                ui.strong("Column Name");
+            });
+            header.col(|ui| {
+                ui.strong("Data Type");
+            });
+            header.col(|ui| {
+                ui.strong("PK");
+            });
+            header.col(|ui| {
+                ui.strong("Nullable");
+            });
+            header.col(|ui| {
+                ui.strong("Default Value");
+            });
+            header.col(|ui| {
+                ui.strong("Actions");
+            });
         })
         .body(|body| {
             body.rows(row_height, columns.len(), |mut row| {
@@ -90,12 +116,17 @@ pub fn render_columns_view(
                 if let Some(col) = columns.get(idx) {
                     // #
                     row.col(|ui| {
-                        ui.label(RichText::new((idx + 1).to_string()).size(11.0).color(Color32::DARK_GRAY));
+                        ui.label(
+                            RichText::new((idx + 1).to_string())
+                                .size(11.0)
+                                .color(Color32::DARK_GRAY),
+                        );
                     });
 
                     // Name
                     row.col(|ui| {
-                        let name_label = ui.selectable_label(false, RichText::new(&col.name).strong().monospace());
+                        let name_label = ui
+                            .selectable_label(false, RichText::new(&col.name).strong().monospace());
                         if name_label.clicked() {
                             action = Some(ColumnsViewAction::CopyName(col.name.clone()));
                         }
@@ -103,13 +134,21 @@ pub fn render_columns_view(
 
                     // Type
                     row.col(|ui| {
-                        ui.label(RichText::new(&col.data_type).monospace().color(Color32::from_rgb(100, 180, 240)));
+                        ui.label(
+                            RichText::new(&col.data_type)
+                                .monospace()
+                                .color(Color32::from_rgb(100, 180, 240)),
+                        );
                     });
 
                     // PK
                     row.col(|ui| {
                         if col.is_primary_key {
-                            ui.label(RichText::new("🔑 YES").color(Color32::from_rgb(255, 200, 50)).strong());
+                            ui.label(
+                                RichText::new("🔑 YES")
+                                    .color(Color32::from_rgb(255, 200, 50))
+                                    .strong(),
+                            );
                         } else {
                             ui.label(RichText::new("-").color(Color32::DARK_GRAY));
                         }
@@ -120,7 +159,11 @@ pub fn render_columns_view(
                         if col.is_nullable {
                             ui.label(RichText::new("YES").color(Color32::LIGHT_GRAY));
                         } else {
-                            ui.label(RichText::new("NO").color(Color32::from_rgb(255, 120, 120)).strong());
+                            ui.label(
+                                RichText::new("NO")
+                                    .color(Color32::from_rgb(255, 120, 120))
+                                    .strong(),
+                            );
                         }
                     });
 
@@ -135,7 +178,11 @@ pub fn render_columns_view(
 
                     // Actions
                     row.col(|ui| {
-                        if ui.small_button("🗑️ Drop").on_hover_text("Drop this column").clicked() {
+                        if ui
+                            .small_button("🗑️ Drop")
+                            .on_hover_text("Drop this column")
+                            .clicked()
+                        {
                             action = Some(ColumnsViewAction::ConfirmDropColumn {
                                 schema: schema.to_string(),
                                 table: table.to_string(),

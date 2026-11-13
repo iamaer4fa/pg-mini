@@ -11,6 +11,7 @@ use crate::models::{
     AppConfig, CellValue, ColumnItem, ConfirmAction, ConfirmDialogState, DatabaseItem,
     DbObjectKind, DbObjectRef, EditableCell, QueryResult, RoleItem, TableItem,
 };
+use crate::sql_safety::{is_explain_analyze, sql_requires_review};
 use crate::system_stats::SystemStatsSnapshot;
 use crate::ui::activity_view::render_activity_view;
 use crate::ui::columns_view::{ColumnsViewAction, render_columns_view};
@@ -48,6 +49,7 @@ struct ConnectedServer {
     current_db: String,
     host_port: String,
     is_busy: bool,
+    transaction_open: bool,
     ha_status: Option<HaNodeStatus>,
     ha_error: Option<String>,
     ha_status_pending: bool,
@@ -72,6 +74,12 @@ pub struct PgMiniApp {
     // Connection state
     is_connected: bool,
     is_busy: bool,
+    sql_query_running: bool,
+    active_sql_query_id: Option<u64>,
+    next_sql_query_id: u64,
+    transaction_open: bool,
+    close_transaction_warning: bool,
+    allow_close_after_transaction_warning: bool,
     current_db: String,
     host_port: String,
     connection_modal: ConnectionModal,
@@ -149,6 +157,12 @@ impl PgMiniApp {
             pending_connection: None,
             is_connected: false,
             is_busy: false,
+            sql_query_running: false,
+            active_sql_query_id: None,
+            next_sql_query_id: 1,
+            transaction_open: false,
+            close_transaction_warning: false,
+            allow_close_after_transaction_warning: false,
             current_db: String::new(),
             host_port: String::new(),
             connection_modal,
@@ -196,6 +210,89 @@ impl PgMiniApp {
             created_at: Instant::now(),
             is_error,
         });
+    }
+
+    fn queue_sql_execution(&mut self, sql: String, read_only: bool) {
+        if sql_requires_review(&sql) {
+            let risk = if is_explain_analyze(&sql) {
+                "EXPLAIN ANALYZE executes the statement and can modify data or cause other statement side effects. Review both its cost and effects."
+            } else {
+                "Review this SQL carefully. This command may modify data or database objects."
+            };
+            let target = self
+                .active_connection
+                .as_ref()
+                .map(|connection| {
+                    format!(
+                        "{} — {} / {}",
+                        connection.name, self.host_port, self.current_db
+                    )
+                })
+                .unwrap_or_else(|| format!("{} / {}", self.host_port, self.current_db));
+            self.confirm_dialog = ConfirmDialogState {
+                is_open: true,
+                title: "Review SQL Operation".to_string(),
+                message: format!("Target: {target}\n\n{risk}"),
+                action: Some(ConfirmAction::ExecuteSql { sql, read_only }),
+            };
+        } else {
+            self.submit_sql_execution(sql, read_only);
+        }
+    }
+
+    fn submit_sql_execution(&mut self, sql: String, read_only: bool) {
+        let query_id = self.next_sql_query_id;
+        self.next_sql_query_id = self.next_sql_query_id.wrapping_add(1).max(1);
+        self.active_sql_query_id = Some(query_id);
+        self.sql_query_running = true;
+        self.last_query_result = None;
+        self.db_worker.send(DbRequest::ExecuteSql {
+            query_id,
+            sql,
+            read_only,
+        });
+    }
+
+    fn queue_ddl_execution(&mut self, sql: String, operation: &str) {
+        let target = self
+            .active_connection
+            .as_ref()
+            .map(|connection| {
+                format!(
+                    "{} — {} / {}",
+                    connection.name, self.host_port, self.current_db
+                )
+            })
+            .unwrap_or_else(|| format!("{} / {}", self.host_port, self.current_db));
+        self.confirm_dialog = ConfirmDialogState {
+            is_open: true,
+            title: "Review Generated SQL".to_string(),
+            message: format!("{operation}\nTarget: {target}"),
+            action: Some(ConfirmAction::ExecuteDdl(sql)),
+        };
+    }
+
+    fn has_open_transaction(&self) -> bool {
+        self.transaction_open
+            || self
+                .connected_servers
+                .iter()
+                .any(|server| server.transaction_open)
+    }
+
+    fn request_database_switch(&mut self, db_name: String) {
+        if self.transaction_open {
+            self.confirm_dialog = ConfirmDialogState {
+                is_open: true,
+                title: "Switch database with open transaction".to_string(),
+                message: format!(
+                    "Switching database closes the current PostgreSQL session and rolls back uncommitted changes. Switch to '{db_name}' anyway?"
+                ),
+                action: Some(ConfirmAction::SwitchDatabaseWithOpenTransaction { db_name }),
+            };
+        } else {
+            self.db_worker.send(DbRequest::SwitchDatabase(db_name));
+        }
     }
 
     fn request_activity_refresh(&mut self) {
@@ -407,6 +504,8 @@ impl PgMiniApp {
         self.system_stats_snapshot = None;
         self.system_stats_updated_at = None;
         self.last_query_result = None;
+        self.sql_query_running = false;
+        self.active_sql_query_id = None;
         self.table_data_state = DataTableState::default();
         self.sidebar.reset_object_tree();
     }
@@ -441,6 +540,7 @@ impl PgMiniApp {
                     current_db: self.current_db.clone(),
                     host_port: self.host_port.clone(),
                     is_busy: self.is_busy,
+                    transaction_open: self.transaction_open,
                     ha_status: self.active_ha_status.take(),
                     ha_error: self.active_ha_error.take(),
                     ha_status_pending: self.active_ha_status_pending,
@@ -451,6 +551,8 @@ impl PgMiniApp {
 
         self.is_connected = false;
         self.is_busy = false;
+        self.sql_query_running = false;
+        self.transaction_open = false;
         self.active_connection = None;
         self.active_ha_status = None;
         self.active_ha_error = None;
@@ -484,6 +586,7 @@ impl PgMiniApp {
                     current_db: self.current_db.clone(),
                     host_port: self.host_port.clone(),
                     is_busy: self.is_busy,
+                    transaction_open: self.transaction_open,
                     ha_status: self.active_ha_status.take(),
                     ha_error: self.active_ha_error.take(),
                     ha_status_pending: self.active_ha_status_pending,
@@ -497,6 +600,8 @@ impl PgMiniApp {
         self.host_port = server.host_port;
         self.is_connected = true;
         self.is_busy = server.is_busy;
+        self.transaction_open = server.transaction_open;
+        self.sql_query_running = false;
         self.active_ha_status = server.ha_status;
         self.active_ha_error = server.ha_error;
         self.active_ha_status_pending = server.ha_status_pending;
@@ -526,6 +631,9 @@ impl PgMiniApp {
             while let Some(response) = server.worker.try_recv() {
                 match response {
                     DbResponse::Busy(is_busy) => server.is_busy = is_busy,
+                    DbResponse::TransactionState(is_open) => server.transaction_open = is_open,
+                    DbResponse::QueryCancelled { .. } => {}
+                    DbResponse::QueryResult(Ok(_)) => {}
                     DbResponse::Disconnected => {
                         disconnected_server_ids.push(server.config.id.clone());
                         self.ha_provisioning.finish_preflight(
@@ -650,6 +758,7 @@ impl PgMiniApp {
                     host_port,
                 } => {
                     self.is_connected = true;
+                    self.transaction_open = false;
                     self.active_connection = self.pending_connection.take();
                     self.current_db = current_db.clone();
                     self.host_port = host_port.clone();
@@ -727,6 +836,8 @@ impl PgMiniApp {
                         );
                     }
                     self.is_connected = false;
+                    self.transaction_open = false;
+                    self.sql_query_running = false;
                     self.active_connection = None;
                     self.is_busy = false;
                     self.active_ha_status = None;
@@ -813,6 +924,7 @@ impl PgMiniApp {
                     server_version: _,
                 } => {
                     self.current_db = db_name.clone();
+                    self.transaction_open = false;
                     self.system_stats_snapshot = None;
                     self.system_stats_updated_at = None;
                     if let Some(connection) = &mut self.active_connection {
@@ -931,8 +1043,30 @@ impl PgMiniApp {
                     }
                 },
                 DbResponse::QueryResult(res) => {
+                    let has_more = res.as_ref().is_ok_and(|result| result.has_more_rows);
+                    self.sql_query_running = false;
+                    if !has_more {
+                        self.active_sql_query_id = None;
+                    }
                     self.last_query_result = Some(res);
                     self.active_tab = ActiveTab::SqlEditor;
+                }
+                DbResponse::QueryCancelled { query_id } => {
+                    if self.active_sql_query_id != Some(query_id) {
+                        continue;
+                    }
+                    self.sql_query_running = false;
+                    self.active_sql_query_id = None;
+                    if let Some(Ok(result)) = &mut self.last_query_result {
+                        result.has_more_rows = false;
+                    }
+                    self.show_toast(
+                        "Cancellation requested; PostgreSQL may have completed the statement before the request arrived. Rows already fetched are retained.",
+                        false,
+                    );
+                }
+                DbResponse::TransactionState(is_open) => {
+                    self.transaction_open = is_open;
                 }
                 DbResponse::OperationSuccess {
                     message,
@@ -979,6 +1113,35 @@ impl PgMiniApp {
     }
 }
 
+fn quote_sql_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn delete_row_preview_sql(
+    schema: &str,
+    table: &str,
+    primary_key: &[(String, CellValue)],
+) -> String {
+    let predicate = primary_key
+        .iter()
+        .map(|(name, value)| {
+            let column = quote_sql_ident(name);
+            if value.is_null {
+                format!("{column} IS NULL")
+            } else {
+                let escaped = value.text.replace('\\', "\\\\").replace('\'', "\\'");
+                format!("{column} IS NOT DISTINCT FROM E'{escaped}'")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!(
+        "DELETE FROM {}.{} WHERE {predicate};",
+        quote_sql_ident(schema),
+        quote_sql_ident(table)
+    )
+}
+
 fn max_reported_lag(status: &HaNodeStatus) -> Option<f64> {
     match &status.replication {
         ReplicationStatus::Primary { standbys } => standbys
@@ -999,6 +1162,13 @@ fn max_reported_lag(status: &HaNodeStatus) -> Option<f64> {
 impl eframe::App for PgMiniApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_db_responses(ctx);
+        if !self.allow_close_after_transaction_warning
+            && ctx.input(|input| input.viewport().close_requested())
+            && self.has_open_transaction()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_transaction_warning = true;
+        }
         if self.active_tab == ActiveTab::Activity {
             ctx.request_repaint_after(Duration::from_secs(1));
             if self.is_connected
@@ -1108,7 +1278,16 @@ impl eframe::App for PgMiniApp {
                         .add_enabled(!self.is_busy, egui::Button::new("🔌 Disconnect"))
                         .clicked()
                     {
-                        self.db_worker.send(DbRequest::Disconnect);
+                        if self.transaction_open {
+                            self.confirm_dialog = ConfirmDialogState {
+                                is_open: true,
+                                title: "Disconnect with open transaction".to_string(),
+                                message: "Disconnecting closes this PostgreSQL session and rolls back any uncommitted changes. Commit or roll back explicitly first, or confirm to disconnect.".to_string(),
+                                action: Some(ConfirmAction::DisconnectWithOpenTransaction),
+                            };
+                        } else {
+                            self.db_worker.send(DbRequest::Disconnect);
+                        }
                     }
                 } else {
                     ui.label(RichText::new("●").color(Color32::from_rgb(220, 50, 50)));
@@ -1222,7 +1401,7 @@ impl eframe::App for PgMiniApp {
                 ) {
                     match action {
                         SidebarAction::SwitchDatabase(db_name) => {
-                            self.db_worker.send(DbRequest::SwitchDatabase(db_name));
+                            self.request_database_switch(db_name);
                         }
                         SidebarAction::RefreshDatabases => {
                             self.db_worker.send(DbRequest::FetchDatabases);
@@ -1249,10 +1428,13 @@ impl eframe::App for PgMiniApp {
                                 name: table,
                                 identity_arguments: None,
                             };
-                            self.db_worker.send(DbRequest::ExecuteSql(format!(
-                                "SELECT count(*) AS total_rows FROM {};",
-                                object.qualified_name()
-                            )));
+                            self.queue_sql_execution(
+                                format!(
+                                    "SELECT count(*) AS total_rows FROM {};",
+                                    object.qualified_name()
+                                ),
+                                false,
+                            );
                             self.active_tab = ActiveTab::SqlEditor;
                         }
                         SidebarAction::ViewColumns { schema, table } => {
@@ -1266,7 +1448,7 @@ impl eframe::App for PgMiniApp {
                         }
                         SidebarAction::OpenQueryToolForDb(db_name) => {
                             if db_name != self.current_db {
-                                self.db_worker.send(DbRequest::SwitchDatabase(db_name));
+                                self.request_database_switch(db_name);
                             }
                             self.active_tab = ActiveTab::SqlEditor;
                         }
@@ -1283,26 +1465,40 @@ impl eframe::App for PgMiniApp {
                             self.object_ddl_modal.open(form);
                         }
                         SidebarAction::ConfirmDropTable { schema, table } => {
+                            let sql = format!(
+                                "DROP TABLE IF EXISTS {}.{} CASCADE;",
+                                quote_sql_ident(&schema),
+                                quote_sql_ident(&table)
+                            );
                             self.confirm_dialog = ConfirmDialogState {
                                 is_open: true,
                                 title: "Drop Table".to_string(),
-                                message: format!("Are you sure you want to permanently drop table '{}.{}' and delete all its data?", schema, table),
+                                message: format!("Permanently drop table '{}.{}' and delete all its data?\n\nSQL preview:\n{sql}", schema, table),
                                 action: Some(ConfirmAction::DropTable { schema, table }),
                             };
                         }
                         SidebarAction::ConfirmTruncateTable { schema, table } => {
+                            let sql = format!(
+                                "TRUNCATE TABLE {}.{} RESTART IDENTITY CASCADE;",
+                                quote_sql_ident(&schema),
+                                quote_sql_ident(&table)
+                            );
                             self.confirm_dialog = ConfirmDialogState {
                                 is_open: true,
                                 title: "Truncate Table".to_string(),
-                                message: format!("Are you sure you want to truncate table '{}.{}'? All records will be removed.", schema, table),
+                                message: format!("Truncate table '{}.{}'? All records will be removed.\n\nSQL preview:\n{sql}", schema, table),
                                 action: Some(ConfirmAction::TruncateTable { schema, table }),
                             };
                         }
                         SidebarAction::ConfirmDropDatabase { db_name } => {
+                            let sql = format!(
+                                "DROP DATABASE IF EXISTS {};",
+                                quote_sql_ident(&db_name)
+                            );
                             self.confirm_dialog = ConfirmDialogState {
                                 is_open: true,
                                 title: "Drop Database".to_string(),
-                                message: format!("Are you sure you want to permanently delete database '{}'?", db_name),
+                                message: format!("Permanently delete database '{}'?\n\nSQL preview:\n{sql}", db_name),
                                 action: Some(ConfirmAction::DropDatabase { db_name }),
                             };
                         }
@@ -1369,11 +1565,12 @@ impl eframe::App for PgMiniApp {
                             self.rename_object = Some(object);
                         }
                         SidebarAction::ConfirmDropObject(object) => {
+                            let sql = object.drop_sql();
                             self.confirm_dialog = ConfirmDialogState {
                                 is_open: true,
                                 title: format!("Delete {}", object.kind.singular()),
                                 message: format!(
-                                    "Delete {} '{}'?",
+                                    "Delete {} '{}'? This operation may remove dependent objects.\n\nSQL preview:\n{sql}",
                                     object.kind.singular().to_lowercase(),
                                     object.qualified_name()
                                 ),
@@ -1560,7 +1757,12 @@ impl eframe::App for PgMiniApp {
                                         self.confirm_dialog = ConfirmDialogState {
                                             is_open: true,
                                             title: "Delete Row".to_string(),
-                                            message: format!("Delete this row from {}.{}? This cannot be undone.", schema, table),
+                                            message: format!(
+                                                "Delete this row from {}.{}? This cannot be undone.\n\nSQL preview:\n{}",
+                                                schema,
+                                                table,
+                                                delete_row_preview_sql(schema, table, &keys)
+                                            ),
                                             action: Some(ConfirmAction::DeleteRow { schema: schema.clone(), table: table.clone(), primary_key: keys }),
                                         };
                                         self.table_data_state.mutation_pending = false;
@@ -1578,17 +1780,40 @@ impl eframe::App for PgMiniApp {
                 }
                 ActiveTab::SqlEditor => {
                     let previous_history = self.sql_editor.history.clone();
+                    let statement_timeout_seconds = self
+                        .active_connection
+                        .as_ref()
+                        .map(|connection| connection.statement_timeout_seconds)
+                        .unwrap_or_default();
+                    let lock_timeout_seconds = self
+                        .active_connection
+                        .as_ref()
+                        .map(|connection| connection.lock_timeout_seconds)
+                        .unwrap_or_default();
                     if let Some(action) = self.sql_editor.show(
                         ui,
                         &self.last_query_result,
                         self.is_connected,
                         self.is_busy,
+                        self.sql_query_running,
+                        self.transaction_open,
+                        statement_timeout_seconds,
+                        lock_timeout_seconds,
                         &self.tables,
                         &self.current_columns,
                     ) {
                         match action {
-                            SqlEditorAction::ExecuteQuery(query) => {
-                                self.db_worker.send(DbRequest::ExecuteSql(query));
+                            SqlEditorAction::ExecuteQuery { sql, read_only } => {
+                                self.queue_sql_execution(sql, read_only);
+                            }
+                            SqlEditorAction::FetchMoreRows => {
+                                self.sql_query_running = true;
+                                self.db_worker.send(DbRequest::FetchMoreQueryRows);
+                            }
+                            SqlEditorAction::CancelQuery => {
+                                if let Some(query_id) = self.active_sql_query_id {
+                                    self.db_worker.cancel_query(query_id);
+                                }
                             }
                             SqlEditorAction::CopyCell(text) => {
                                 ctx.output_mut(|o| o.copied_text = text.clone());
@@ -1635,10 +1860,16 @@ impl eframe::App for PgMiniApp {
                                 self.add_column_modal.open_for(&schema, &table);
                             }
                             ColumnsViewAction::ConfirmDropColumn { schema, table, column } => {
+                                let sql = format!(
+                                    "ALTER TABLE {}.{} DROP COLUMN {} CASCADE;",
+                                    quote_sql_ident(&schema),
+                                    quote_sql_ident(&table),
+                                    quote_sql_ident(&column)
+                                );
                                 self.confirm_dialog = ConfirmDialogState {
                                     is_open: true,
                                     title: "Drop Column".to_string(),
-                                    message: format!("Are you sure you want to drop column '{}' from '{}.{}'?", column, schema, table),
+                                    message: format!("Drop column '{}' from '{}.{}'?\n\nSQL preview:\n{sql}", column, schema, table),
                                     action: Some(ConfirmAction::DropColumn { schema, table, column }),
                                 };
                             }
@@ -1663,11 +1894,12 @@ impl eframe::App for PgMiniApp {
                                 self.db_worker.send(DbRequest::SaveRole(form))
                             }
                             RolesAction::Drop(role_name) => {
+                                let sql = format!("DROP ROLE {};", quote_sql_ident(&role_name));
                                 self.confirm_dialog = ConfirmDialogState {
                                     is_open: true,
                                     title: "Drop PostgreSQL Role".to_string(),
                                     message: format!(
-                                        "Drop role '{role_name}'? PostgreSQL will reject this if the role still owns objects or has privileges that must be reassigned or revoked."
+                                        "Drop role '{role_name}'? PostgreSQL will reject this if the role still owns objects or has privileges that must be reassigned or revoked.\n\nSQL preview:\n{sql}"
                                     ),
                                     action: Some(ConfirmAction::DropRole { role_name }),
                                 };
@@ -1833,7 +2065,7 @@ impl eframe::App for PgMiniApp {
         }
 
         if let Some(sql) = self.object_ddl_modal.show(ctx, self.is_busy, &self.roles) {
-            self.db_worker.send(DbRequest::ExecuteDdl(sql));
+            self.queue_ddl_execution(sql, "Review this schema change before execution.");
         }
 
         if let Some(action) = render_confirm_dialog(ctx, &mut self.confirm_dialog, self.is_busy) {
@@ -1866,6 +2098,18 @@ impl eframe::App for PgMiniApp {
                     self.db_worker
                         .send(DbRequest::RestoreDatabase { db_name, file_path });
                 }
+                ConfirmAction::ExecuteSql { sql, read_only } => {
+                    self.submit_sql_execution(sql, read_only);
+                }
+                ConfirmAction::ExecuteDdl(sql) => {
+                    self.db_worker.send(DbRequest::ExecuteDdl(sql));
+                }
+                ConfirmAction::SwitchDatabaseWithOpenTransaction { db_name } => {
+                    self.db_worker.send(DbRequest::SwitchDatabase(db_name));
+                }
+                ConfirmAction::DisconnectWithOpenTransaction => {
+                    self.db_worker.send(DbRequest::Disconnect);
+                }
                 ConfirmAction::DropObject { object } => {
                     self.db_worker.send(DbRequest::DropObject(object));
                 }
@@ -1882,6 +2126,32 @@ impl eframe::App for PgMiniApp {
                     });
                 }
             }
+        }
+
+        if self.close_transaction_warning {
+            let mut keep_open = true;
+            egui::Window::new("Open transaction")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut keep_open)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(
+                        "One or more connected sessions have an open transaction. Closing pg-mini will close those connections and PostgreSQL will roll back uncommitted changes.",
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Stay in pg-mini").clicked() {
+                            self.close_transaction_warning = false;
+                        }
+                        if ui.button("Close anyway").clicked() {
+                            self.allow_close_after_transaction_warning = true;
+                            self.close_transaction_warning = false;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                });
+            self.close_transaction_warning &= keep_open;
         }
 
         if let Some(object) = self.rename_object.clone() {
@@ -1915,10 +2185,18 @@ impl eframe::App for PgMiniApp {
                 keep_open = false;
             }
             if submit_rename {
-                self.db_worker.send(DbRequest::RenameObject {
-                    object,
-                    new_name: self.rename_object_name.trim().to_string(),
-                });
+                let new_name = self.rename_object_name.trim();
+                if let Some(sql) = object.rename_sql(new_name) {
+                    self.queue_ddl_execution(
+                        sql,
+                        &format!("Rename {} '{}'.", object.kind.singular(), object.name),
+                    );
+                } else {
+                    self.show_toast(
+                        format!("Renaming {} is not supported", object.kind.singular()),
+                        true,
+                    );
+                }
                 keep_open = false;
             }
             if !keep_open {
