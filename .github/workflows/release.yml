@@ -58,6 +58,7 @@ jobs:
       - name: Install bash and build dependencies
         shell: sh
         run: |
+          dnf -y swap curl-minimal curl
           dnf install --assumeyes bash curl gcc gcc-c++ git gzip \
             libX11-devel libXcursor-devel libXi-devel libXrandr-devel \
             libxcb-devel libxkbcommon-devel make mesa-libGL-devel \
