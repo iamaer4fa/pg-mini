@@ -21,6 +21,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install Linux build dependencies
+        shell: sh
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
@@ -54,6 +55,7 @@ jobs:
     container: rockylinux:9
     steps:
       - name: Install build dependencies
+        shell: sh
         run: |
           dnf install --assumeyes --allowerasing \
             bash \
