@@ -1,6 +1,6 @@
 [package]
 name = "pg-mini"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 
 [dependencies]
@@ -11,6 +11,8 @@ egui = "0.29"
 egui_extras = "0.29"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
+open = "5.0"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 rfd = "0.17.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"

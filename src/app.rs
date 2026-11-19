@@ -13,6 +13,7 @@ use crate::models::{
 };
 use crate::sql_safety::{is_explain_analyze, sql_requires_review};
 use crate::system_stats::SystemStatsSnapshot;
+use crate::update;
 use crate::ui::activity_view::render_activity_view;
 use crate::ui::backup_restore::{BackupRestoreAction, BackupRestoreDialog};
 use crate::ui::columns_view::{ColumnsViewAction, render_columns_view};
@@ -1407,6 +1408,20 @@ impl eframe::App for PgMiniApp {
                             .size(11.0)
                             .color(Color32::DARK_GRAY),
                     );
+
+                    // Update indicator
+                    if let Some(update_info) = &self.config.update_info {
+                        if update_info.has_update {
+                            ui.add_space(16.0);
+                            if ui
+                                .link(RichText::new("🔔 Update available!").color(Color32::from_rgb(220, 180, 50)).strong())
+                                .on_hover_text("Click to view release notes")
+                                .clicked()
+                            {
+                                let _ = open::that(&update_info.release_url);
+                            }
+                        }
+                    }
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2317,6 +2332,58 @@ impl eframe::App for PgMiniApp {
                     ui.label("• Instant startup & async query execution");
                     ui.add_space(12.0);
                     ui.separator();
+
+                    // Update information
+                    if let Some(update_info) = &self.config.update_info {
+                        ui.add_space(8.0);
+                        if update_info.has_update {
+                            ui.colored_label(egui::Color32::from_rgb(220, 180, 50), format!("🔔 Update available: v{}", update_info.latest_version));
+                            ui.label(format!("Current version: v{}", update_info.current_version));
+                            if ui.link("View release notes").clicked() {
+                                let _ = open::that(&update_info.release_url);
+                            }
+                        } else {
+                            ui.colored_label(egui::Color32::from_rgb(100, 220, 100), "✓ You are running the latest version");
+                            ui.label(format!("Current version: v{}", update_info.current_version));
+                        }
+                        if let Some(checked_at) = &update_info.checked_at {
+                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(checked_at) {
+                                ui.label(format!("Last checked: {}", dt.format("%Y-%m-%d %H:%M UTC")));
+                            }
+                        }
+                        ui.add_space(8.0);
+                        ui.separator();
+                    }
+
+                    // Update settings and manual check
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let mut check_enabled = self.config.check_for_updates;
+                        if ui.checkbox(&mut check_enabled, "Check for updates automatically on startup").changed() {
+                            self.config.check_for_updates = check_enabled;
+                            let _ = ConfigManager::save(&self.config);
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("🔍 Check for Updates Now").clicked() {
+                            // Spawn a manual update check
+                            let config = self.config.clone();
+                            tokio::spawn(async move {
+                                if let Some(update_info) = update::check_for_updates(&config).await {
+                                    let mut config = config;
+                                    config.last_update_check = update_info.checked_at.clone();
+                                    config.update_info = Some(update_info);
+                                    let _ = ConfigManager::save(&config);
+                                }
+                            });
+                        }
+                        if ui.button("Open Releases Page").clicked() {
+                            let _ = open::that("https://github.com/iamaer4fa/pg-mini/releases");
+                        }
+                    });
+
+                    ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Close").clicked() {

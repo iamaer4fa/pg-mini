@@ -670,6 +670,16 @@ impl Default for ConfirmDialogState {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UpdateInfo {
+    pub current_version: String,
+    pub latest_version: String,
+    pub has_update: bool,
+    pub release_notes: String,
+    pub release_url: String,
+    pub checked_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -683,6 +693,12 @@ pub struct AppConfig {
     pub ha_clusters: Vec<crate::ha::HaCluster>,
     #[serde(default)]
     pub ha_monitoring: crate::ha::HaMonitoringConfig,
+    #[serde(default = "default_true")]
+    pub check_for_updates: bool,
+    #[serde(default)]
+    pub last_update_check: Option<String>,
+    #[serde(default)]
+    pub update_info: Option<UpdateInfo>,
 }
 
 fn default_true() -> bool {
@@ -698,6 +714,9 @@ impl Default for AppConfig {
             query_history: Vec::new(),
             ha_clusters: Vec::new(),
             ha_monitoring: crate::ha::HaMonitoringConfig::default(),
+            check_for_updates: true,
+            last_update_check: None,
+            update_info: None,
         }
     }
 }
