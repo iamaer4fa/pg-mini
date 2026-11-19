@@ -53,7 +53,7 @@ jobs:
   build-rpm:
     name: Build RHEL-compatible RPM
     runs-on: ubuntu-24.04
-    container: rockylinux:9
+    container: rockylinux:10
     steps:
       - name: Install build dependencies
         shell: sh
@@ -84,7 +84,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: rocky-9-rpm
+          key: rocky-10-rpm
 
       - name: Verify release tag
         if: startsWith(github.ref, 'refs/tags/')
