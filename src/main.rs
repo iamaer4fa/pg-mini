@@ -15,8 +15,6 @@ pub mod ui;
 pub mod update;
 
 use app::PgMiniApp;
-use config::ConfigManager;
-use update::spawn_update_check;
 
 #[cfg(target_os = "windows")]
 fn select_renderer() -> eframe::Renderer {
@@ -137,12 +135,6 @@ fn windows_opengl_2_available() -> bool {
 }
 
 fn main() -> eframe::Result<()> {
-    // Load config early to check for updates
-    let config = ConfigManager::load();
-
-    // Spawn background update check
-    spawn_update_check(config.clone());
-
     let icon_image = image::load_from_memory(include_bytes!("../assets/pg-mini.png"))
         .expect("embedded pg-mini icon must be a valid PNG")
         .into_rgba8();

@@ -13,7 +13,6 @@ use crate::models::{
 };
 use crate::sql_safety::{is_explain_analyze, sql_requires_review};
 use crate::system_stats::SystemStatsSnapshot;
-use crate::update;
 use crate::ui::activity_view::render_activity_view;
 use crate::ui::backup_restore::{BackupRestoreAction, BackupRestoreDialog};
 use crate::ui::columns_view::{ColumnsViewAction, render_columns_view};
@@ -27,6 +26,7 @@ use crate::ui::sidebar::{Sidebar, SidebarAction};
 use crate::ui::sql_editor::{SqlEditor, SqlEditorAction};
 use crate::ui::system_stats::render_system_stats_view;
 use crate::ui::theme::setup_custom_theme;
+use crate::update;
 
 #[derive(PartialEq)]
 pub enum ActiveTab {
@@ -135,6 +135,11 @@ impl PgMiniApp {
         let config = ConfigManager::load();
 
         setup_custom_theme(&cc.egui_ctx, config.dark_mode);
+
+        // Run the update check on its own Tokio runtime, outside the UI thread.
+        if config.check_for_updates {
+            update::spawn_update_check(config.clone());
+        }
 
         let initial_cfg = config
             .saved_connections
@@ -2367,16 +2372,7 @@ impl eframe::App for PgMiniApp {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui.button("🔍 Check for Updates Now").clicked() {
-                            // Spawn a manual update check
-                            let config = self.config.clone();
-                            tokio::spawn(async move {
-                                if let Some(update_info) = update::check_for_updates(&config).await {
-                                    let mut config = config;
-                                    config.last_update_check = update_info.checked_at.clone();
-                                    config.update_info = Some(update_info);
-                                    let _ = ConfigManager::save(&config);
-                                }
-                            });
+                            update::spawn_update_check(self.config.clone());
                         }
                         if ui.button("Open Releases Page").clicked() {
                             let _ = open::that("https://github.com/iamaer4fa/pg-mini/releases");

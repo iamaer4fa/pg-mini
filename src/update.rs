@@ -90,13 +90,32 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// Background task to check for updates and store result in config
 pub fn spawn_update_check(config: AppConfig) {
-    tokio::spawn(async move {
-        if let Some(update_info) = check_for_updates(&config).await {
-            // Save the update check time and info to config
-            let mut config = config;
-            config.last_update_check = update_info.checked_at.clone();
-            config.update_info = Some(update_info);
-            let _ = crate::config::ConfigManager::save(&config);
-        }
-    });
+    let result = std::thread::Builder::new()
+        .name("pg-mini-update-check".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("Failed to create update-check Tokio runtime: {error}");
+                    return;
+                }
+            };
+
+            if let Some(update_info) = runtime.block_on(check_for_updates(&config)) {
+                let mut latest_config = crate::config::ConfigManager::load();
+                latest_config.last_update_check = update_info.checked_at.clone();
+                latest_config.update_info = Some(update_info);
+                if let Err(error) = crate::config::ConfigManager::save(&latest_config) {
+                    eprintln!("Failed to save update-check result: {error}");
+                }
+            }
+        });
+
+    if let Err(error) = result {
+        eprintln!("Failed to start update check: {error}");
+    }
 }
