@@ -53,52 +53,23 @@ jobs:
   build-rpm:
     name: Build RHEL-compatible RPM
     runs-on: ubuntu-24.04
-    container: rockylinux:9
+    container: rockylinux/rockylinux:9
     steps:
-      - name: Install bash and build dependencies
+      - name: Install build dependencies
         shell: sh
         run: |
           dnf -y swap curl-minimal curl
-          dnf install --assumeyes bash curl gcc gcc-c++ git gzip \
+          dnf install --assumeyes bash gcc gcc-c++ git gzip \
             libX11-devel libXcursor-devel libXi-devel libXrandr-devel \
             libxcb-devel libxkbcommon-devel make mesa-libGL-devel \
             pkgconf-pkg-config rpm-build tar wayland-devel
 
-      - name: Install build dependencies
-        shell: sh
-        run: |
-          dnf install --assumeyes --allowerasing \
-            bash \
-            curl \
-            gcc \
-            gcc-c++ \
-            git \
-            gzip \
-            libX11-devel \
-            libXcursor-devel \
-            libXi-devel \
-            libXrandr-devel \
-            libxcb-devel \
-            libxkbcommon-devel \
-            make \
-            mesa-libGL-devel \
-            pkgconf-pkg-config \
-            rpm-build \
-            tar \
-            wayland-devel
-
       - uses: actions/checkout@v4
-
-      #- uses: dtolnay/rust-toolchain@stable
-      - name: Install curl
-        shell: sh
-        run: dnf install --assumeyes curl
 
       - name: Install Rust (manual rustup for container)
         shell: sh
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -106,12 +77,16 @@ jobs:
 
       - name: Verify release tag
         if: startsWith(github.ref, 'refs/tags/')
+        shell: sh
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           test "$GITHUB_REF_NAME" = "v$version"
 
       - name: Build RPM package
-        run: ./packaging/build-rpm.sh
+        shell: sh
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          ./packaging/build-rpm.sh
 
       - uses: actions/upload-artifact@v4
         with:
