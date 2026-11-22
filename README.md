@@ -6,7 +6,7 @@
 [![Platform](https://img.shields.io/badge/Platform-Linux%20(Wayland%20%26%20X11)-black.svg)](#)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](#license)
 
-*pg-mini* is an ultra-lightweight, high-performance native desktop GUI client dedicated exclusively to PostgreSQL and built in *pure Rust*. Like pgAdmin 4, its scope is strictly PostgreSQL server, schema, query, and replication management—with no multi-database abstraction layer or unrelated database engines—without the heavy web runtime or JVM overhead.
+**pg-mini** is an ultra-lightweight, high-performance native desktop GUI client dedicated exclusively to PostgreSQL and built in **pure Rust**. Like pgAdmin 4, its scope is strictly PostgreSQL server, schema, query, and replication management—with no multi-database abstraction layer or unrelated database engines—without the heavy web runtime or JVM overhead.
 
 
 If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloated, or slow to start due to embedded web engines (Chromium/Electron) or Java virtual machines, **pg-mini** was created for you.
