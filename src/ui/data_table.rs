@@ -115,7 +115,7 @@ pub fn render_data_table(
                         .map(|_| EditableCell {
                             text: String::new(),
                             is_null: false,
-                            use_default: true,
+                            use_default: false,
                         })
                         .collect(),
                 );
@@ -275,6 +275,10 @@ pub fn render_data_table(
     let text_height = egui::TextStyle::Body.resolve(ui.style()).size;
     let row_height = text_height + 8.0;
 
+    // Add one extra row for the "adding row" if in insert mode
+    let adding_row_active = state.adding_row.is_some();
+    let total_rows = display_rows.len() + if adding_row_active { 1 } else { 0 };
+
     TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
@@ -307,9 +311,99 @@ pub fn render_data_table(
             }
         })
         .body(|body| {
-            body.rows(row_height, display_rows.len(), |mut row| {
+            body.rows(row_height, total_rows, |mut row| {
                 let idx = row.index();
-                if let Some((original_idx, row_data)) = display_rows.get(idx) {
+                let is_new_row = adding_row_active && idx == display_rows.len();
+
+                if is_new_row {
+                    // Render the new row being added (inline editing mode)
+                    let _page_offset = if is_table_view {
+                        state.current_page * state.page_limit
+                    } else {
+                        0
+                    };
+
+                    // Row number col (show as "+" for new row)
+                    row.col(|ui| {
+                        ui.label(
+                            RichText::new("+")
+                                .size(11.0)
+                                .color(Color32::from_rgb(100, 220, 100))
+                                .strong(),
+                        );
+                    });
+
+                    // Cells - render as editable inputs
+                    if let Some(values) = state.adding_row.as_mut() {
+                        for c_idx in 0..result.columns.len() {
+                            row.col(|ui| {
+                                if let Some(value) = values.get_mut(c_idx) {
+                                    let widget_id = ui.id().with("new_row_cell").with(c_idx);
+                                    ui.horizontal(|ui| {
+                                        // Text input - always render but disable interaction if NULL or DEFAULT
+                                        let text_edit = egui::TextEdit::singleline(&mut value.text)
+                                            .desired_width(95.0)
+                                            .id(widget_id);
+                                        let enabled = !value.is_null && !value.use_default;
+                                        let resp = if enabled {
+                                            ui.add(text_edit)
+                                        } else {
+                                            ui.add_enabled(false, text_edit)
+                                        };
+                                        // Auto-focus first cell on first render
+                                        if c_idx == 0 && !resp.has_focus() {
+                                            ui.memory_mut(|m| m.request_focus(widget_id));
+                                        }
+                                        // NULL checkbox
+                                        let null_changed = ui.checkbox(&mut value.is_null, "NULL").changed();
+                                        if null_changed && value.is_null {
+                                            value.use_default = false;
+                                        }
+                                        // DEFAULT checkbox
+                                        let default_changed = ui.checkbox(&mut value.use_default, "DEFAULT").changed();
+                                        if default_changed && value.use_default {
+                                            value.is_null = false;
+                                        }
+                                    });
+                                } else {
+                                    ui.label("");
+                                }
+                            });
+                        }
+                    }
+
+                    // Actions column for new row
+                    if is_table_view && allow_insert && !primary_key_columns.is_empty() {
+                        row.col(|ui| {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        !state.mutation_pending,
+                                        egui::Button::new("Save").fill(Color32::from_rgb(60, 160, 80)),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some(values) = &state.adding_row {
+                                        action = Some(DataTableAction::InsertRow {
+                                            values: values.clone(),
+                                        });
+                                        state.mutation_pending = true;
+                                    }
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !state.mutation_pending,
+                                        egui::Button::new("Cancel"),
+                                    )
+                                    .clicked()
+                                {
+                                    state.adding_row = None;
+                                }
+                            });
+                        });
+                    }
+                } else if let Some((original_idx, row_data)) = display_rows.get(idx) {
+                    // Existing row rendering (unchanged)
                     let page_offset = if is_table_view {
                         state.current_page * state.page_limit
                     } else {
@@ -457,62 +551,6 @@ pub fn render_data_table(
                 }
             });
         });
-
-    let mut cancel_insert = false;
-    if let Some(values) = state.adding_row.as_mut() {
-        egui::CollapsingHeader::new("New row values")
-            .default_open(true)
-            .show(ui, |ui| {
-                egui::Grid::new("new_table_row_grid")
-                    .num_columns(3)
-                    .show(ui, |ui| {
-                        for (idx, col) in result.columns.iter().enumerate() {
-                            if let Some(value) = values.get_mut(idx) {
-                                ui.label(RichText::new(col).strong());
-                                ui.add_enabled_ui(!value.is_null && !value.use_default, |ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut value.text)
-                                            .desired_width(220.0),
-                                    );
-                                });
-                                ui.horizontal(|ui| {
-                                    if ui.checkbox(&mut value.is_null, "NULL").changed()
-                                        && value.is_null
-                                    {
-                                        value.use_default = false;
-                                    }
-                                    if ui.checkbox(&mut value.use_default, "DEFAULT").changed()
-                                        && value.use_default
-                                    {
-                                        value.is_null = false;
-                                    }
-                                });
-                                ui.end_row();
-                            }
-                        }
-                    });
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!state.mutation_pending, egui::Button::new("Insert row"))
-                        .clicked()
-                    {
-                        action = Some(DataTableAction::InsertRow {
-                            values: values.clone(),
-                        });
-                        state.mutation_pending = true;
-                    }
-                    if ui
-                        .add_enabled(!state.mutation_pending, egui::Button::new("Cancel"))
-                        .clicked()
-                    {
-                        cancel_insert = true;
-                    }
-                });
-            });
-    }
-    if cancel_insert {
-        state.adding_row = None;
-    }
 
     action
 }
