@@ -17,7 +17,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 
 - **⚡ Instant Startup**: Launches in under 100 milliseconds.
 - **🪶 Tiny Memory Footprint**: Uses only **~25–35 MB of RAM** under normal usage (compared to 400 MB – 1 GB+ in pgAdmin and Electron tools).
-- **🚫 Zero Web Engine / Electron / JVM**: Compiles to an **18 MB native binary** with zero Chromium, Node.js, or Java runtime dependencies.
+- **🚫 Zero Web Engine / Electron / JVM**: Compiles to an **25 MB native binary** with zero Chromium, Node.js, or Java runtime dependencies.
 - **🎯 Asynchronous Architecture**: Dedicated background thread with Tokio runtime keeps the user interface buttery-smooth (60+ FPS) during heavy database queries.
 - **🖥️ Native Linux Display**: Full support for both **Wayland** and **X11** display servers.
 
