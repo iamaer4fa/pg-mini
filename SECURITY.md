@@ -6,6 +6,7 @@ pg-mini is currently in **Beta**. Because the project is evolving rapidly and is
 
 | Version | Supported          |
 | ------- | ------------------ |
+| 0.1.16   | :white_check_mark: |
 | 0.1.15   | :white_check_mark: |
 | 0.1.14   | :white_check_mark: |
 | < 0.1.0   | :x:                |

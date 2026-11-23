@@ -2338,18 +2338,19 @@ impl eframe::App for PgMiniApp {
                     ui.add_space(12.0);
                     ui.separator();
 
+                    
                     // Update information
                     if let Some(update_info) = &self.config.update_info {
                         ui.add_space(8.0);
                         if update_info.has_update {
                             ui.colored_label(egui::Color32::from_rgb(220, 180, 50), format!("🔔 Update available: v{}", update_info.latest_version));
-                            ui.label(format!("Current version: v{}", update_info.current_version));
+                            ui.label(concat!("Current version: v", env!("CARGO_PKG_VERSION")));
                             if ui.link("View release notes").clicked() {
                                 let _ = open::that(&update_info.release_url);
                             }
                         } else {
                             ui.colored_label(egui::Color32::from_rgb(100, 220, 100), "✓ You are running the latest version");
-                            ui.label(format!("Current version: v{}", update_info.current_version));
+                            ui.label(concat!("Current version: v", env!("CARGO_PKG_VERSION")));
                         }
                         if let Some(checked_at) = &update_info.checked_at {
                             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(checked_at) {

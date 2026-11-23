@@ -20,14 +20,9 @@ pub async fn check_for_updates(config: &AppConfig) -> Option<UpdateInfo> {
         return None;
     }
 
-    // Check if we should skip based on last check time (check at most once per day)
-    if let Some(last_check) = &config.last_update_check {
-        let now = chrono::Utc::now();
-        let last_check_dt = chrono::DateTime::parse_from_rfc3339(last_check).ok()?;
-        let elapsed = now.signed_duration_since(last_check_dt.with_timezone(&chrono::Utc));
-        if elapsed < chrono::Duration::days(1) {
-            return None;
-        }
+    let current_version = env!("CARGO_PKG_VERSION").trim_start_matches('v');
+    if should_skip_recent_check(config, current_version, chrono::Utc::now()) {
+        return None;
     }
 
     // Fetch latest release from GitHub
@@ -47,9 +42,7 @@ pub async fn check_for_updates(config: &AppConfig) -> Option<UpdateInfo> {
     let release: GitHubRelease = response.json().await.ok()?;
 
     // Parse versions (strip 'v' prefix if present)
-    let current_version = env!("CARGO_PKG_VERSION");
     let latest_version = release.tag_name.trim_start_matches('v');
-    let current_version = current_version.trim_start_matches('v');
 
     // Compare versions
     let has_update = compare_versions(current_version, latest_version).is_lt();
@@ -62,6 +55,29 @@ pub async fn check_for_updates(config: &AppConfig) -> Option<UpdateInfo> {
         release_url: release.html_url,
         checked_at: Some(chrono::Utc::now().to_rfc3339()),
     })
+}
+
+fn should_skip_recent_check(
+    config: &AppConfig,
+    current_version: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if config
+        .update_info
+        .as_ref()
+        .is_some_and(|info| info.current_version != current_version)
+    {
+        return false;
+    }
+
+    config
+        .last_update_check
+        .as_ref()
+        .and_then(|last_check| chrono::DateTime::parse_from_rfc3339(last_check).ok())
+        .is_some_and(|last_check| {
+            now.signed_duration_since(last_check.with_timezone(&chrono::Utc))
+                < chrono::Duration::days(1)
+        })
 }
 
 /// Compare two version strings (semver-like)
@@ -86,6 +102,30 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
         }
     }
     std::cmp::Ordering::Equal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_skip_recent_check;
+    use crate::models::{AppConfig, UpdateInfo};
+
+    #[test]
+    fn stale_update_info_does_not_suppress_check_after_version_change() {
+        let now = chrono::Utc::now();
+        let mut config = AppConfig {
+            last_update_check: Some(now.to_rfc3339()),
+            ..AppConfig::default()
+        };
+        config.update_info = Some(UpdateInfo {
+            current_version: "0.1.15".to_string(),
+            ..UpdateInfo::default()
+        });
+
+        assert!(!should_skip_recent_check(&config, "0.1.16", now));
+
+        config.update_info.as_mut().unwrap().current_version = "0.1.16".to_string();
+        assert!(should_skip_recent_check(&config, "0.1.16", now));
+    }
 }
 
 /// Background task to check for updates and store result in config

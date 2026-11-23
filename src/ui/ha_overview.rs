@@ -400,9 +400,18 @@ fn render_relationships(
     let desired_size = egui::vec2(ui.available_width().max(240.0), height);
     let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
+    let visuals = ui.visuals().clone();
 
-    painter.rect_filled(rect, 6.0, Color32::from_rgb(16, 20, 26));
-    painter.rect_stroke(rect, 6.0, egui::Stroke::new(1.0, Color32::from_rgb(55, 65, 81)));
+    painter.rect_filled(rect, 6.0, visuals.panel_fill);
+
+    painter.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(
+            1.0,
+            visuals.widgets.noninteractive.bg_stroke.color,
+        ),
+    );
 
     let left_x = rect.left() + 16.0;
     let right_x = (rect.right() - box_size.x - 16.0).max(left_x);
@@ -427,7 +436,7 @@ fn render_relationships(
                 .as_ref()
                 .and_then(|s| s.system_identifier.clone()),
         };
-        draw_node_box(&painter, node_rect, &topo_node, false);
+        draw_node_box(&painter, node_rect, &topo_node, false, &visuals);
     }
 
     for (idx, standby) in standbys.iter().enumerate() {
@@ -447,7 +456,7 @@ fn render_relationships(
                 .as_ref()
                 .and_then(|s| s.system_identifier.clone()),
         };
-        draw_node_box(&painter, node_rect, &topo_node, false);
+        draw_node_box(&painter, node_rect, &topo_node, false, &visuals);
     }
 
     for standby in &standbys {
@@ -496,7 +505,7 @@ fn render_relationships(
                     egui::Align2::CENTER_BOTTOM,
                     edge_label,
                     egui::FontId::proportional(11.0),
-                    Color32::LIGHT_GREEN,
+                    visuals.strong_text_color(),
                 );
             }
         }
@@ -586,24 +595,25 @@ fn draw_node_box(
     rect: egui::Rect,
     node: &TopologyNode,
     is_selected: bool,
+    visuals: &egui::Visuals,
 ) {
     let accent = match node.state {
         TopologyNodeState::PrimaryHealthy => Color32::from_rgb(100, 220, 130),
         TopologyNodeState::StandbyHealthy => Color32::from_rgb(100, 180, 255),
         TopologyNodeState::Stale => Color32::YELLOW,
         TopologyNodeState::Error => Color32::LIGHT_RED,
-        TopologyNodeState::Disconnected => Color32::GRAY,
+        TopologyNodeState::Disconnected => visuals.weak_text_color(),
     };
     let stroke_width: f32 = if is_selected { 2.5 } else { 1.25 };
 
-    painter.rect_filled(rect, 6.0, Color32::from_rgb(24, 28, 34));
+    painter.rect_filled(rect, 6.0, visuals.extreme_bg_color);
     painter.rect_stroke(rect, 6.0, egui::Stroke::new(stroke_width, accent));
     painter.text(
         rect.left_top() + egui::vec2(10.0, 8.0),
         egui::Align2::LEFT_TOP,
         &node.label,
         egui::FontId::proportional(14.0),
-        Color32::WHITE,
+        visuals.text_color(),
     );
     painter.text(
         rect.right_top() + egui::vec2(-10.0, 9.0),
@@ -617,7 +627,7 @@ fn draw_node_box(
         egui::Align2::LEFT_TOP,
         &node.endpoint,
         egui::FontId::proportional(11.5),
-        Color32::GRAY,
+        visuals.weak_text_color(),
     );
 }
 
