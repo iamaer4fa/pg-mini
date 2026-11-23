@@ -1,5 +1,6 @@
 use egui::{CentralPanel, Color32, RichText, SidePanel, TopBottomPanel};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::activity::ActivitySnapshot;
@@ -128,18 +129,19 @@ pub struct PgMiniApp {
     sidebar: Sidebar,
     toast: Option<Toast>,
     show_about: bool,
+    update_check_receiver: Option<Receiver<Option<crate::models::UpdateInfo>>>,
 }
 
 impl PgMiniApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config = ConfigManager::load();
+        let update_check_receiver = if config.check_for_updates {
+            Some(update::spawn_update_check(config.clone(), true))
+        } else {
+            None
+        };
 
         setup_custom_theme(&cc.egui_ctx, config.dark_mode);
-
-        // Run the update check on its own Tokio runtime, outside the UI thread.
-        if config.check_for_updates {
-            update::spawn_update_check(config.clone());
-        }
 
         let initial_cfg = config
             .saved_connections
@@ -212,6 +214,29 @@ impl PgMiniApp {
             sidebar: Sidebar::default(),
             toast: None,
             show_about: false,
+            update_check_receiver,
+        }
+    }
+
+    fn poll_update_check(&mut self, ctx: &egui::Context) {
+        let result = match &self.update_check_receiver {
+            Some(receiver) => receiver.try_recv(),
+            None => return,
+        };
+
+        match result {
+            Ok(Some(update_info)) => {
+                self.config.last_update_check = update_info.checked_at.clone();
+                self.config.update_info = Some(update_info);
+                self.update_check_receiver = None;
+                ctx.request_repaint();
+            }
+            Ok(None) | Err(TryRecvError::Disconnected) => {
+                self.update_check_receiver = None;
+            }
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
         }
     }
 
@@ -1194,6 +1219,7 @@ fn max_reported_lag(status: &HaNodeStatus) -> Option<f64> {
 
 impl eframe::App for PgMiniApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_update_check(ctx);
         self.poll_db_responses(ctx);
         if !self.allow_close_after_transaction_warning
             && ctx.input(|input| input.viewport().close_requested())
@@ -2372,8 +2398,18 @@ impl eframe::App for PgMiniApp {
                     });
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if ui.button("🔍 Check for Updates Now").clicked() {
-                            update::spawn_update_check(self.config.clone());
+                        let checking = self.update_check_receiver.is_some();
+                        let button_text = if checking {
+                            "Checking for Updates..."
+                        } else {
+                            "🔍 Check for Updates Now"
+                        };
+                        if ui
+                            .add_enabled(!checking, egui::Button::new(button_text))
+                            .clicked()
+                        {
+                            self.update_check_receiver =
+                                Some(update::spawn_update_check(self.config.clone(), true));
                         }
                         if ui.button("Open Releases Page").clicked() {
                             let _ = open::that("https://github.com/iamaer4fa/pg-mini/releases");

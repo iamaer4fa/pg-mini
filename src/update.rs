@@ -1,5 +1,6 @@
 use crate::models::{AppConfig, UpdateInfo};
 use serde::{Deserialize, Serialize};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,14 +15,14 @@ struct GitHubRelease {
 }
 
 /// Checks for updates against GitHub releases
-pub async fn check_for_updates(config: &AppConfig) -> Option<UpdateInfo> {
+pub async fn check_for_updates(config: &AppConfig, force: bool) -> Option<UpdateInfo> {
     // Only check if auto-update check is enabled
-    if !config.check_for_updates {
+    if !config.check_for_updates && !force {
         return None;
     }
 
     let current_version = env!("CARGO_PKG_VERSION").trim_start_matches('v');
-    if should_skip_recent_check(config, current_version, chrono::Utc::now()) {
+    if should_skip_recent_check(config, current_version, chrono::Utc::now(), force) {
         return None;
     }
 
@@ -61,7 +62,12 @@ fn should_skip_recent_check(
     config: &AppConfig,
     current_version: &str,
     now: chrono::DateTime<chrono::Utc>,
+    force: bool,
 ) -> bool {
+    if force {
+        return false;
+    }
+
     if config
         .update_info
         .as_ref()
@@ -121,15 +127,17 @@ mod tests {
             ..UpdateInfo::default()
         });
 
-        assert!(!should_skip_recent_check(&config, "0.1.16", now));
+        assert!(!should_skip_recent_check(&config, "0.1.16", now, false));
 
         config.update_info.as_mut().unwrap().current_version = "0.1.16".to_string();
-        assert!(should_skip_recent_check(&config, "0.1.16", now));
+        assert!(should_skip_recent_check(&config, "0.1.16", now, false));
+        assert!(!should_skip_recent_check(&config, "0.1.16", now, true));
     }
 }
 
 /// Background task to check for updates and store result in config
-pub fn spawn_update_check(config: AppConfig) {
+pub fn spawn_update_check(config: AppConfig, force: bool) -> Receiver<Option<UpdateInfo>> {
+    let (result_sender, result_receiver) = mpsc::channel();
     let result = std::thread::Builder::new()
         .name("pg-mini-update-check".to_string())
         .spawn(move || {
@@ -145,17 +153,24 @@ pub fn spawn_update_check(config: AppConfig) {
                 }
             };
 
-            if let Some(update_info) = runtime.block_on(check_for_updates(&config)) {
-                let mut latest_config = crate::config::ConfigManager::load();
-                latest_config.last_update_check = update_info.checked_at.clone();
-                latest_config.update_info = Some(update_info);
-                if let Err(error) = crate::config::ConfigManager::save(&latest_config) {
-                    eprintln!("Failed to save update-check result: {error}");
-                }
+            let Some(update_info) = runtime.block_on(check_for_updates(&config, force)) else {
+                let _ = result_sender.send(None);
+                return;
+            };
+
+            let mut latest_config = crate::config::ConfigManager::load();
+            latest_config.last_update_check = update_info.checked_at.clone();
+            latest_config.update_info = Some(update_info.clone());
+            if let Err(error) = crate::config::ConfigManager::save(&latest_config) {
+                eprintln!("Failed to save update-check result: {error}");
             }
+
+            let _ = result_sender.send(Some(update_info));
         });
 
     if let Err(error) = result {
         eprintln!("Failed to start update check: {error}");
     }
+
+    result_receiver
 }
