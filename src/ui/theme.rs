@@ -1,5 +1,19 @@
 use egui::{Color32, Rounding, Stroke};
 
+pub fn setup_custom_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "NotoSans-Regular".to_string(),
+        egui::FontData::from_static(include_bytes!("../../assets/fonts/NotoSans-Regular.ttf")),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "NotoSans-Regular".to_string());
+    ctx.set_fonts(fonts);
+}
+
 pub fn setup_custom_theme(ctx: &egui::Context, dark_mode: bool) {
     if dark_mode {
         let mut visuals = egui::Visuals::dark();

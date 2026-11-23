@@ -26,7 +26,7 @@ use crate::ui::roles::{RolesAction, RolesViewState};
 use crate::ui::sidebar::{Sidebar, SidebarAction};
 use crate::ui::sql_editor::{SqlEditor, SqlEditorAction};
 use crate::ui::system_stats::render_system_stats_view;
-use crate::ui::theme::setup_custom_theme;
+use crate::ui::theme::{setup_custom_fonts, setup_custom_theme};
 use crate::update;
 
 #[derive(PartialEq)]
@@ -141,6 +141,7 @@ impl PgMiniApp {
             None
         };
 
+        setup_custom_fonts(&cc.egui_ctx);
         setup_custom_theme(&cc.egui_ctx, config.dark_mode);
 
         let initial_cfg = config
