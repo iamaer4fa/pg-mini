@@ -30,7 +30,7 @@ If you find **pgAdmin 4**, **DBeaver**, or **Beekeeper Studio** too heavy, bloat
 | **Technology** | **Native Rust (`egui`)** | Python + NW.js/Chromium | Electron (Chromium + Node) | Java Eclipse RCP |
 | **Startup Time** | **< 0.1s** | 4 – 10s | 2 – 5s | 5 – 12s |
 | **RAM Usage** | **~30 MB** | 400 MB – 1 GB+ | 300 – 600 MB | 500 MB – 1.5 GB |
-| **Binary Size** | **~18 MB** | ~250 MB | ~150 MB | ~300 MB |
+| **Binary Size** | **~25 MB** | ~250 MB | ~150 MB | ~300 MB |
 | **UI Responsiveness** | Instant | Laggy / Web DOM | Moderate | Heavy |
 
 ---
