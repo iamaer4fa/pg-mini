@@ -5,6 +5,9 @@ use crate::ha::{
 use crate::models::ConnectionConfig;
 use egui::{Color32, RichText, Ui};
 use std::time::Duration;
+use crate::ha::{TopologyNode, TopologyNodeState};
+use std::collections::HashMap;
+
 
 pub fn render_ha_overview(
     ui: &mut Ui,
@@ -390,131 +393,113 @@ fn render_relationships(
         })
         .collect();
 
-    if standbys.is_empty() {
-        let configured_standbys = configured_members.iter().any(|node| {
-            node.status
+    // 1. Allocate the canvas once primaries and standbys are known
+    let rows = primaries.len().max(standbys.len()).max(1) as f32;
+    let box_size = egui::vec2(190.0, 56.0);
+    let height = (rows * 68.0 + 24.0).max(140.0);
+    let desired_size = egui::vec2(ui.available_width().max(240.0), height);
+    let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    painter.rect_filled(rect, 6.0, Color32::from_rgb(16, 20, 26));
+    painter.rect_stroke(rect, 6.0, egui::Stroke::new(1.0, Color32::from_rgb(55, 65, 81)));
+
+    let left_x = rect.left() + 16.0;
+    let right_x = (rect.right() - box_size.x - 16.0).max(left_x);
+
+    let mut primary_rects: HashMap<String, egui::Rect> = HashMap::new();
+    let mut standby_rects: HashMap<String, egui::Rect> = HashMap::new();
+
+    for (idx, primary) in primaries.iter().enumerate() {
+        let node_rect = egui::Rect::from_min_size(
+            egui::pos2(left_x, rect.top() + 14.0 + idx as f32 * 68.0),
+            box_size,
+        );
+        primary_rects.insert(primary.connection_id.clone(), node_rect);
+        let topo_node = TopologyNode {
+            connection_id: primary.connection_id.clone(),
+            label: primary.name.clone(),
+            endpoint: primary.host_port.clone(),
+            role_label: "Primary".to_string(),
+            state: TopologyNodeState::PrimaryHealthy,
+            system_identifier: primary
+                .status
                 .as_ref()
-                .is_some_and(|status| status.role == NodeRole::Standby)
-        });
-        if configured_standbys {
-            ui.label(
-                "Standby topology is stale or disconnected; current relationship is unverified.",
-            );
-        } else {
-            ui.label("No connected standby is currently identified.");
-        }
-        return;
+                .and_then(|s| s.system_identifier.clone()),
+        };
+        draw_node_box(&painter, node_rect, &topo_node, false);
     }
-    for standby in standbys {
-        let receiver = standby.status.as_ref().and_then(|status| {
+
+    for (idx, standby) in standbys.iter().enumerate() {
+        let node_rect = egui::Rect::from_min_size(
+            egui::pos2(right_x, rect.top() + 14.0 + idx as f32 * 68.0),
+            box_size,
+        );
+        standby_rects.insert(standby.connection_id.clone(), node_rect);
+        let topo_node = TopologyNode {
+            connection_id: standby.connection_id.clone(),
+            label: standby.name.clone(),
+            endpoint: standby.host_port.clone(),
+            role_label: "Standby".to_string(),
+            state: TopologyNodeState::StandbyHealthy,
+            system_identifier: standby
+                .status
+                .as_ref()
+                .and_then(|s| s.system_identifier.clone()),
+        };
+        draw_node_box(&painter, node_rect, &topo_node, false);
+    }
+
+    for standby in &standbys {
+        let Some(receiver) = standby.status.as_ref().and_then(|status| {
             if let ReplicationStatus::Standby { receiver } = &status.replication {
                 receiver.as_ref()
             } else {
                 None
             }
-        });
-        let Some(receiver) = receiver else {
-            ui.label(format!(
-                "{} — upstream relationship unknown (no WAL receiver metadata)",
-                standby.name
-            ));
+        }) else {
             continue;
         };
+
         let upstream_host = receiver.sender_host.as_deref();
         let upstream_port = receiver
             .sender_port
             .as_deref()
             .and_then(|port| port.parse::<u16>().ok());
-        let matches: Vec<_> = primaries
-            .iter()
-            .copied()
-            .filter(|primary| {
-                upstream_matches_primary(
-                    upstream_host,
-                    upstream_port,
-                    &primary.configured_host,
-                    primary.configured_port,
-                )
-            })
-            .collect();
 
-        match matches.as_slice() {
-            [primary] => {
-                let primary_id = primary
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.system_identifier.as_deref());
-                let standby_id = standby
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.system_identifier.as_deref());
-                if let (Some(primary_id), Some(standby_id)) = (primary_id, standby_id) {
-                    if primary_id != standby_id {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} !→ {} — system identifiers differ; cluster membership conflict",
-                                primary.name, standby.name
-                            ))
-                            .color(Color32::LIGHT_RED),
-                        );
-                        continue;
-                    }
-                }
-                ui.label(
-                    RichText::new(format!(
-                        "{} → {} — upstream endpoint matches PostgreSQL receiver metadata{}",
-                        primary.name,
-                        standby.name,
-                        if primary_id.is_some() && standby_id.is_some() {
-                            " and system identifiers match"
-                        } else {
-                            "; system identifier comparison unavailable"
-                        }
-                    ))
-                    .color(Color32::LIGHT_GREEN),
+        for primary in primaries.iter().filter(|primary| {
+            upstream_matches_primary(
+                upstream_host,
+                upstream_port,
+                &primary.configured_host,
+                primary.configured_port,
+            )
+        }) {
+            if let (Some(&from_rect), Some(&to_rect)) = (
+                primary_rects.get(&primary.connection_id),
+                standby_rects.get(&standby.connection_id),
+            ) {
+                let start = from_rect.right_center();
+                let end = to_rect.left_center();
+                let stroke = egui::Stroke::new(2.0, Color32::from_rgb(100, 220, 130));
+                painter.line_segment([start, end], stroke);
+                draw_arrow_head(&painter, start, end, stroke.color);
+
+                let midpoint = egui::pos2((start.x + end.x) * 0.5, (start.y + end.y) * 0.5 - 10.0);
+                let edge_label = format!(
+                    "{} · {}",
+                    receiver.status.as_deref().unwrap_or("unknown"),
+                    receiver.slot_name.as_deref().unwrap_or("no slot"),
+                );
+                painter.text(
+                    midpoint,
+                    egui::Align2::CENTER_BOTTOM,
+                    edge_label,
+                    egui::FontId::proportional(11.0),
+                    Color32::LIGHT_GREEN,
                 );
             }
-            [] => {
-                let same_cluster = standby
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.system_identifier.as_deref())
-                    .is_some_and(|standby_id| {
-                        primaries.iter().any(|primary| {
-                            primary
-                                .status
-                                .as_ref()
-                                .and_then(|status| status.system_identifier.as_deref())
-                                == Some(standby_id)
-                        })
-                    });
-                ui.label(
-                    RichText::new(if same_cluster {
-                        format!(
-                            "{} — system identifier matches a primary, but upstream endpoint is not verified",
-                            standby.name
-                        )
-                    } else if primaries.is_empty() {
-                        format!("{} — no connected primary available to verify upstream", standby.name)
-                    } else {
-                        format!(
-                            "{} — upstream endpoint does not match a configured primary; relationship unverified",
-                            standby.name
-                        )
-                    })
-                    .color(Color32::YELLOW),
-                );
-            }
-            _ => {
-                ui.label(
-                    RichText::new(format!(
-                        "{} — upstream endpoint matches multiple configured primaries; relationship ambiguous",
-                        standby.name
-                    ))
-                    .color(Color32::YELLOW),
-                );
-            }
-        };
+        }
     }
 }
 
@@ -594,6 +579,62 @@ fn upstream_matches_primary(
     upstream_host.is_some_and(|host| {
         host.trim().eq_ignore_ascii_case(primary_host.trim()) && upstream_port == Some(primary_port)
     })
+}
+
+fn draw_node_box(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    node: &TopologyNode,
+    is_selected: bool,
+) {
+    let accent = match node.state {
+        TopologyNodeState::PrimaryHealthy => Color32::from_rgb(100, 220, 130),
+        TopologyNodeState::StandbyHealthy => Color32::from_rgb(100, 180, 255),
+        TopologyNodeState::Stale => Color32::YELLOW,
+        TopologyNodeState::Error => Color32::LIGHT_RED,
+        TopologyNodeState::Disconnected => Color32::GRAY,
+    };
+    let stroke_width: f32 = if is_selected { 2.5 } else { 1.25 };
+
+    painter.rect_filled(rect, 6.0, Color32::from_rgb(24, 28, 34));
+    painter.rect_stroke(rect, 6.0, egui::Stroke::new(stroke_width, accent));
+    painter.text(
+        rect.left_top() + egui::vec2(10.0, 8.0),
+        egui::Align2::LEFT_TOP,
+        &node.label,
+        egui::FontId::proportional(14.0),
+        Color32::WHITE,
+    );
+    painter.text(
+        rect.right_top() + egui::vec2(-10.0, 9.0),
+        egui::Align2::RIGHT_TOP,
+        &node.role_label,
+        egui::FontId::proportional(12.0),
+        accent,
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(10.0, 28.0),
+        egui::Align2::LEFT_TOP,
+        &node.endpoint,
+        egui::FontId::proportional(11.5),
+        Color32::GRAY,
+    );
+}
+
+fn draw_arrow_head(painter: &egui::Painter, start: egui::Pos2, end: egui::Pos2, color: Color32) {
+    let dir = (end - start).normalized();
+    if !dir.x.is_finite() || !dir.y.is_finite() {
+        return;
+    }
+    let perp = egui::vec2(-dir.y, dir.x);
+    let tip = end;
+    let left = tip - dir * 10.0 + perp * 5.0;
+    let right = tip - dir * 10.0 - perp * 5.0;
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip, left, right],
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 
 #[cfg(test)]

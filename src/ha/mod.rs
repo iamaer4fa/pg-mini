@@ -166,6 +166,48 @@ pub struct HaCluster {
     pub connection_ids: Vec<String>,
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologyNodeState {
+    PrimaryHealthy,
+    StandbyHealthy,
+    Stale,
+    Disconnected,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyNode {
+    pub connection_id: String,
+    pub label: String,
+    pub endpoint: String,
+    pub role_label: String,
+    pub state: TopologyNodeState,
+    pub system_identifier: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologyEdgeHealth {
+    Verified,
+    Unverified,
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyEdge {
+    pub from_connection_id: String,
+    pub to_connection_id: String,
+    pub label: String,
+    pub health: TopologyEdgeHealth,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterTopology {
+    pub nodes: Vec<TopologyNode>,
+    pub edges: Vec<TopologyEdge>,
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::{HaCluster, NodeRole, PrimaryStandbyStatus, WalReceiverStatus};
