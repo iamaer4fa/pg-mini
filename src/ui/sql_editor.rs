@@ -186,15 +186,8 @@ impl SqlEditor {
             (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(Key::Enter)
                 || i.key_pressed(Key::F5)
         });
-
-        if ctrl_enter && is_connected && !is_busy && !self.sql_text.trim().is_empty() {
-            let query = self.sql_text.trim().to_string();
-            self.add_history(&query);
-            return Some(SqlEditorAction::ExecuteQuery {
-                sql: query,
-                read_only: self.read_only_mode,
-            });
-        }
+        let mut run_query_clicked = false;
+        let mut selected_query = None;
 
         let query_error = last_result
             .as_ref()
@@ -232,12 +225,7 @@ impl SqlEditor {
                     .fill(Color32::from_rgb(16, 145, 90)),
             );
             if run.clicked() {
-                let query = self.sql_text.trim().to_string();
-                self.add_history(&query);
-                action = Some(SqlEditorAction::ExecuteQuery {
-                    sql: query,
-                    read_only: self.read_only_mode,
-                });
+                run_query_clicked = true;
             }
             if query_running || has_more_rows {
                 if ui
@@ -440,20 +428,33 @@ impl SqlEditor {
                     .id_salt("sql_editor_text")
                     .max_width(ui.available_width())
                     .max_height(self.editor_height)
+                    .min_scrolled_height(self.editor_height)
                     .auto_shrink([false; 2])
                     .scroll_bar_visibility(
                         egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
                     )
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.sql_text)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(6)
-                                .hint_text(
-                                    "-- Type SQL here. Ctrl+Space opens completion; Ctrl+Enter executes.",
-                                )
-                                .layouter(&mut layouter),
+                        let editor_size = ui.available_size();
+                        let output = egui::TextEdit::multiline(&mut self.sql_text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(6)
+                            .min_size(editor_size)
+                            .hint_text(
+                                "-- Type SQL here. Ctrl+Space opens completion; Ctrl+Enter executes.",
+                            )
+                            .layouter(&mut layouter)
+                            .show(ui);
+                        selected_query = selected_sql(
+                            &self.sql_text,
+                            output
+                                .state
+                                .cursor
+                                .char_range()
+                                .map(|range| {
+                                    let sorted = range.sorted();
+                                    sorted[0].index..sorted[1].index
+                                }),
                         );
                     });
             });
@@ -464,7 +465,7 @@ impl SqlEditor {
             .on_hover_text("Drag to resize the SQL editor");
         if resize_handle.dragged() {
             self.editor_height =
-                resized_editor_height(self.editor_height, resize_handle.drag_delta().y);
+                resized_editor_height(self.editor_height, resize_handle.drag_motion().y);
         }
         let handle_color = if resize_handle.hovered() || resize_handle.dragged() {
             ui.visuals().widgets.active.fg_stroke.color
@@ -561,6 +562,22 @@ impl SqlEditor {
                 |ui| render_query_error(ui, &error),
             );
         }
+
+        if (ctrl_enter || run_query_clicked) && is_connected && !is_busy {
+            let query = selected_query
+                .as_deref()
+                .unwrap_or(self.sql_text.as_str())
+                .trim();
+            if !query.is_empty() {
+                let query = query.to_string();
+                self.add_history(&query);
+                action = Some(SqlEditorAction::ExecuteQuery {
+                    sql: query,
+                    read_only: self.read_only_mode,
+                });
+            }
+        }
+
         action
     }
 
@@ -575,6 +592,11 @@ impl SqlEditor {
 
 fn resized_editor_height(current_height: f32, delta: f32) -> f32 {
     (current_height + delta).clamp(MIN_EDITOR_HEIGHT, MAX_EDITOR_HEIGHT)
+}
+
+fn selected_sql(text: &str, range: Option<std::ops::Range<usize>>) -> Option<String> {
+    let range = range?;
+    (range.start < range.end).then(|| text.chars().skip(range.start).take(range.len()).collect())
 }
 
 fn render_query_error(ui: &mut Ui, error: &str) {
@@ -622,7 +644,7 @@ fn trailing_word(text: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ADMIN_INSIGHTS, prepare_query_plan, resized_editor_height};
+    use super::{ADMIN_INSIGHTS, prepare_query_plan, resized_editor_height, selected_sql};
 
     #[test]
     fn query_plan_does_not_execute_the_statement() {
@@ -647,6 +669,16 @@ mod tests {
         assert_eq!(resized_editor_height(180.0, 40.0), 220.0);
         assert_eq!(resized_editor_height(100.0, -50.0), 80.0);
         assert_eq!(resized_editor_height(580.0, 50.0), 600.0);
+    }
+
+    #[test]
+    fn selected_sql_uses_character_offsets_and_ignores_empty_selection() {
+        assert_eq!(
+            selected_sql("αSELECT 1;", Some(1..9)),
+            Some("SELECT 1".to_string())
+        );
+        assert_eq!(selected_sql("SELECT 1;", Some(3..3)), None);
+        assert_eq!(selected_sql("SELECT 1;", None), None);
     }
 }
 
